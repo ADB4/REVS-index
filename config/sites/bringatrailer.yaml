@@ -1,0 +1,130 @@
+site:
+  name: BringATrailer
+  base_url: https://bringatrailer.com
+  source_name: bringatrailer
+
+robots_txt:
+  crawl_delay: 1.0
+  allowed_paths:
+    - /
+  disallowed_paths:
+    - /wp-admin/
+    - /message/
+    - /member/
+    - /account/
+    - /search/
+
+selectors:
+  listing_page:
+    container: .auctions-completed-container
+    cards: .listing-card
+    card_title: h3, h2
+    card_results: .item-results
+    card_excerpt: .item-excerpt
+    sort_dropdown: .toolbar-dropdown.sort-dropdown
+    sort_dropdown_title: .dropdown-title
+    sort_dropdown_options: .dropdown-option
+    
+  detail_page:
+    country: .show-country-name
+    essentials: .essentials
+    essentials_strong: strong
+    essentials_location_link: a[href*="google.com/maps"]
+    essentials_seller_link: a[href*="/member/"]
+    essentials_ul: ul
+    essentials_li: li
+    category_buttons: .group-title
+    listing_stats: "#listing-bid"
+    stat_row: .listing-stats-stat
+    stat_label: .listing-stats-label
+    stat_value: .listing-stats-value
+    post_excerpt: .post-excerpt
+    excerpt_paragraphs: p
+    
+  comment_section:
+    container: "#comments"
+    show_more_button: "#comments-load-button"
+    bid_link: .bid-notification-link
+    all_comments: .comment
+    author_comment: .bypostauthor
+
+extraction_rules:
+  vin:
+    - type: selector
+      selector: .essentials a
+      attribute: text
+      regex: "([A-HJ-NPR-Z0-9]{17})"
+      validation: length_17
+    - type: comment_search
+      selector: "#comments .bypostauthor"
+      patterns:
+        - "chassis[:\\s]+([A-HJ-NPR-Z0-9]{17})"
+        - "vin[:\\s]+([A-HJ-NPR-Z0-9]{17})"
+        - "\\b([A-HJ-NPR-Z0-9]{17})\\b"
+      
+  engine:
+    - type: listing_detail
+      patterns:
+        - "([\\d.]+[- ]?(?:Liter|L)\\s+[\\w\\s-]*)"
+      normalize: true
+      
+  transmission:
+    - type: listing_detail
+      patterns:
+        - "[\\w\\s-]*\\b(\\w+)-Speed[\\w\\s-]*"
+      normalize: true
+      
+  mileage:
+    - type: listing_detail
+      patterns:
+        - "([\\d,]+)\\s*(?:k\\s+)?miles"
+      transform: handle_k_miles
+    - type: title
+      patterns:
+        - "(\\d+\\.?\\d*)k-Mile"
+      transform: multiply_1000
+    - type: comment_search
+      patterns:
+        - "(\\d{1,3}(?:,\\d{3})*)\\s*miles"
+        - "odometer\\s*(?:shows|reads)?\\s*(\\d{1,3}(?:,\\d{3})*)"
+      
+  colors:
+    exterior:
+      patterns:
+        - "(.+?Paint)"
+      next_is_interior: true
+    interior:
+      keywords:
+        - leather
+        - cloth
+        - upholstery
+        - nappa
+        - alcantara
+        - vinyl
+        - suede
+        - interior
+      skip_keywords:
+        - chassis
+        - miles
+        - turbo
+        - liter
+        - speed
+        - transmission
+        - engine
+        - brake
+        - exhaust
+
+javascript:
+  load_more_listings: |
+    var container = document.querySelector('.auctions-completed-container');
+    if (!container) return {error: 'Container not found'};
+    var context = ko.contextFor(container);
+    if (!context || !context.$data) return {error: 'No Knockout context'};
+    var vm = context.$data;
+    var moreAvailable = ko.unwrap(vm.moreListingsAvailable);
+    if (!moreAvailable) return {done: true, reason: 'moreListingsAvailable = false'};
+    if (typeof vm.loadNextPage === 'function') {
+      vm.loadNextPage();
+      return {success: true};
+    }
+    return {error: 'No loadNextPage function'};

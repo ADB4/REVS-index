@@ -1,0 +1,156 @@
+# python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# virtual environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.venv/
+
+# scraped data and outputs
+data/
+*.json
+output/
+raw/
+normalized/
+
+# logs
+*.log
+logs/
+*.log.*
+
+# database
+*.db
+*.sqlite
+*.sqlite3
+
+# environment variables
+.env
+.env.local
+.env.*.local
+*.env
+
+# ide - vscode
+.vscode/
+*.code-workspace
+
+# ide - pycharm
+.idea/
+*.iml
+*.iws
+.idea_modules/
+
+# ide - sublime
+*.sublime-project
+*.sublime-workspace
+
+# ide - eclipse
+.project
+.pydevproject
+.settings/
+
+# os - macos
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# os - windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# os - linux
+*~
+.directory
+
+# selenium and browser drivers
+chromedriver
+geckodriver
+*.crx
+selenium-debug.log
+
+# jupyter notebook
+.ipynb_checkpoints
+*.ipynb
+
+# pytest
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# backup files
+*.bak
+*.swp
+*.swo
+*~
+
+# temporary files
+tmp/
+temp/
+*.tmp
+
+# archive files (except distribution archives)
+*.zip
+*.tar.gz
+*.tar
+*.rar
+
+# except keep example configs
+!example.json
+!sample_config.json
+
+# keep directory structure but ignore contents
+data/**/*
+!data/.gitkeep
+output/**/*
+!output/.gitkeep
+
+# normalization rules (may contain sensitive patterns)
+config/normalization/*.json
+!config/normalization/example_rules.json
+
+# database connection strings
+DATABASE_URL
+db_config.py
+
+# api keys and secrets
+secrets.py
+api_keys.py
+credentials.json
+
+# compiled translations
+*.mo
+
+# documentation build
+docs/_build/
+site/
