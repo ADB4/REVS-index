@@ -1,0 +1,22 @@
+[
+    {
+        "slug": ["db9"],
+        "make": "Aston Martin",
+        "modelFull": "DB9",
+        "modelSHort": "DB9 "
+    },
+    {
+        "slug": ["gt"],
+        "make": "Ford",
+        "modelFull": "GT 1Gen",
+        "modelShort": "GT "
+    },
+    {
+        "slug": ["clk-class"],
+        "make": "Mercedes-Benz",
+        "modelFull": "CLK-Class C209",
+        "modelShort": "CLK",
+        "minYear": 2003,
+        "maxYear": 2009
+    }
+]

@@ -145,17 +145,6 @@ def main():
                 print(f"successfully scraped {len(listings)} {car_config['model_full']} listings")
                 print(f"{'=' * 70}\n")
                 
-                sold = [l for l in listings if l.price]
-                if sold:
-                    prices = [l.price for l in sold]
-                    
-                    print("summary statistics:")
-                    print(f"  total listings: {len(listings)}")
-                    print(f"  listings with price data: {len(sold)}")
-                    print(f"  average sale price: ${sum(prices)/len(prices):,.0f}")
-                    print(f"  price range: ${min(prices):,} - ${max(prices):,}")
-                    print(f"\n{'=' * 70}")
-                
                 if args.append:
                     final_output = output_path.format(count=len(listings))
                 else:
@@ -164,7 +153,23 @@ def main():
                 storage.filepath = final_output
                 storage.save(listings)
                 
-                print(f"\nsaved {len(listings)} listings to {final_output}")
+                print(f"saved {len(listings)} listings to {final_output}")
+                
+                try:
+                    sold = [l for l in listings if l.price is not None and l.price > 0]
+                    if sold:
+                        prices = [l.price for l in sold if l.price is not None]
+                        
+                        if prices:
+                            print("\nsummary statistics:")
+                            print(f"  total listings: {len(listings)}")
+                            print(f"  listings with price data: {len(sold)}")
+                            print(f"  average sale price: ${sum(prices)/len(prices):,.0f}")
+                            print(f"  price range: ${min(prices):,} - ${max(prices):,}")
+                except Exception as e:
+                    print(f"\nwarning: could not calculate summary statistics: {e}")
+                
+                print(f"\n{'=' * 70}")
                 print("done\n")
             else:
                 print("\nno listings found\n")

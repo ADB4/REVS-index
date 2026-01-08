@@ -1,0 +1,200 @@
+[
+    {
+        "slug": ["db9"],
+        "make": "Aston Martin",
+        "modelFull": "DB9",
+        "modelSHort": "DB9 "
+    },
+    {
+        "slug": ["b7-a4"],
+        "make": "Audi",
+        "modelFull": "A4 B7",
+        "modelShort": "A4 "
+    },
+    {
+        "slug": ["tt"],
+        "make": "Audi",
+        "modelFull": "TT MK1",
+        "modelShort": "TT ",
+        "minYear": 1998,
+        "maxYear": 2006
+    },
+    {
+        "slug": ["e46-m3"],
+        "make": "BMW",
+        "modelFull": "M3 E46",
+        "modelShort": "M3"
+    },
+    {
+        "slug": ["c6-corvette"],
+        "make": "Chevrolet",
+        "modelFull": "C6 Corvette",
+        "modelShort": "Corvette "
+    },
+    {
+        "slug": ["viper-zb-i-2003-2006"],
+        "make": "Dodge",
+        "modelFull": "Viper ZB I 2003-2006",
+        "modelShort": "Viper "
+    },
+    {
+        "slug": ["gt"],
+        "make": "Ford",
+        "modelFull": "GT 1Gen",
+        "modelShort": "GT "
+    },
+    {
+        "slug": ["mustang-s197-2005-2014"],
+        "make": "Ford",
+        "modelFull": "Mustang S197 2005-2014",
+        "modelShort": "Mustang ",
+        "minYear": 2004,
+        "maxYear": 2009
+    },
+    {
+        "slug": ["gallardo"],
+        "make": "Lamborghini",
+        "modelFull": "Gallardo",
+        "modelShort": "Gallardo "
+    },
+    {
+        "slug": ["murcielago"],
+        "make": "Lamborghini",
+        "modelFull": "Murcielago",
+        "modelShort": "Murcielago "
+    },
+    {
+        "slug": ["is"],
+        "make": "Lexus",
+        "modelFull": "IS XE10",
+        "modelShort": "IS",
+        "minYear": 1999,
+        "maxYear": 2005
+    },
+    {
+        "slug": ["elise"],
+        "make": "Lotus",
+        "modelFull": "Elise",
+        "modelShort": "Elise "
+    },
+    {
+        "slug": ["rx-7-fd"],
+        "make": "Mazda",
+        "modelFull": "RX-7 FD",
+        "modelShort": "RX-7 "
+    },
+    {
+        "slug": ["rx-8"],
+        "make": "Mazda",
+        "modelFull": "RX-8",
+        "modelShort": "RX-8 "
+    },
+    {
+        "slug": ["clk-class"],
+        "make": "Mercedes-Benz",
+        "modelFull": "CLK-Class C209",
+        "modelShort": "CLK",
+        "minYear": 2003,
+        "maxYear": 2009
+    },
+    {
+        "slug": ["r230-sl"],
+        "make": "Mercedes-Benz",
+        "modelFull": "SL-Class R230",
+        "modelShort": "SL"
+    },
+    {
+        "slug": ["slr-mclaren"],
+        "make": "Mercedes-Benz",
+        "modelFull": "SLR McLaren",
+        "modelShort": "SLR McLaren "
+    },
+    {
+        "slug": ["lancer-evolution"],
+        "make": "Mitsubishi",
+        "modelFull": "Lancer Evolution VIII",
+        "modelShort": "Lancer Evolution VIII ",
+        "minYear": 2003,
+        "maxYear": 2005
+    },
+    {
+        "slug": ["gto-2004-2006"],
+        "make": "Pontiac",
+        "modelFull": "GTO 5Gen",
+        "modelShort": "GTO "
+    },
+    {
+        "slug": ["997-911-carrera", "997-911", "997-911-carrera-4", "997-911-carrera-4s", "997-911-carrera-4-gts","997-911-carrera-gts"],
+        "make": "Porsche",
+        "modelFull": "911 997 Carrera",
+        "modelShort": "911 Carrera "
+    },
+    {
+        "slug": ["997-911-targa-4", "997-911-targa-4s"],
+        "make": "Porsche",
+        "modelFull": "911 997 Targa",
+        "modelShort": "911 Targa "
+    },
+    {
+        "slug": ["997-turbo"],
+        "make": "Porsche",
+        "modelFull": "911 997 Turbo",
+        "modelShort": "911 Turbo "
+    },
+    {
+        "slug": ["997-gt3"],
+        "make": "Porsche",
+        "modelFull": "911 997 GT3",
+        "modelShort": "911 GT3 "
+    },
+    {
+        "slug": ["996-911", "996-911-carrera-4", "996-911-carrera-4s", "996-911-carrera-targa"],
+        "make": "Porsche",
+        "modelFull": "911 996 Carrera",
+        "modelShort": "911 Carrera "
+    },
+    {
+        "slug": ["996-turbo"],
+        "make": "Porsche",
+        "modelFull": "911 996 Turbo",
+        "modelShort": "911 Turbo "
+    },
+    {
+        "slug": ["996-gt3"],
+        "make": "Porsche",
+        "modelFull": "911 996 GT3",
+        "modelShort": "911 GT3 "
+    },
+    {
+        "slug": ["996-gt2"],
+        "make": "Porsche",
+        "modelFull": "911 996 GT2",
+        "modelShort": "911 GT2 "
+    },
+    {
+        "slug": ["carrera-gt"],
+        "make": "Porsche",
+        "modelFull": "Carrera GT",
+        "modelShort": "Carrera GT "
+    },
+    {
+        "slug": ["987-cayman"],
+        "make": "Porsche",
+        "modelFull": "987 Cayman",
+        "modelShort": "Cayman "
+    },
+    {
+        "slug": ["impreza-and-wrx"],
+        "make": "Subaru",
+        "modelFull": "Impreza WRX 2Gen",
+        "modelShort": "Impreza WRX ",
+        "minYear": 2002,
+        "maxYear": 2007
+    },
+    {
+        "slug": ["supra-a80-1994-2002"],
+        "make": "Toyota",
+        "modelFull": "Supra A80",
+        "modelShort": "Supra "
+    }
+]

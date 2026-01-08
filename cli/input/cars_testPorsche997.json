@@ -1,0 +1,26 @@
+[
+    {
+        "slug": ["997-911-carrera", "997-911", "997-911-carrera-4", "997-911-carrera-4s", "997-911-carrera-4-gts","997-911-carrera-gts"],
+        "make": "Porsche",
+        "modelFull": "911 997 Carrera",
+        "modelShort": "911 Carrera "
+    },
+    {
+        "slug": ["997-911-targa-4", "997-911-targa-4s"],
+        "make": "Porsche",
+        "modelFull": "911 997 Targa",
+        "modelShort": "911 Targa "
+    },
+    {
+        "slug": ["997-turbo"],
+        "make": "Porsche",
+        "modelFull": "911 997 Turbo",
+        "modelShort": "911 Turbo "
+    },
+    {
+        "slug": ["997-gt3"],
+        "make": "Porsche",
+        "modelFull": "911 997 GT3",
+        "modelShort": "911 GT3 "
+    }
+]

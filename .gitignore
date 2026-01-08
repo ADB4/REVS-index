@@ -30,10 +30,6 @@ venv.bak/
 .venv/
 
 # scraped data and outputs
-data/
-*.json
-output/
-raw/
 normalized/
 
 # logs
@@ -130,9 +126,7 @@ temp/
 !sample_config.json
 
 # keep directory structure but ignore contents
-data/**/*
 !data/.gitkeep
-output/**/*
 !output/.gitkeep
 
 # normalization rules (may contain sensitive patterns)

@@ -1,0 +1,10 @@
+[
+    {
+        "slug": ["impreza-and-wrx"],
+        "make": "Subaru",
+        "modelFull": "Impreza WRX 2Gen",
+        "modelShort": "Impreza WRX ",
+        "minYear": 2002,
+        "maxYear": 2007
+    }
+]
