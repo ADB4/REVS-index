@@ -1,0 +1,209 @@
+{
+  "timestamp": "2026-01-08T23:43:53.124721",
+  "config": {
+    "input_file": "data/json/output/filter/e46-m3-data-test.json",
+    "model_type": "ollama",
+    "model_name": "mistral:7b",
+    "fields_to_infer": [
+      "engine",
+      "exterior_color",
+      "interior_color",
+      "seller_type"
+    ]
+  },
+  "stats": {
+    "total_entries": 9,
+    "entries_with_na": 9,
+    "entries_skipped": 0,
+    "fields_inferred": {
+      "engine": 0,
+      "exterior_color": 4,
+      "interior_color": 5,
+      "seller_type": 8
+    },
+    "llm_calls": 9
+  },
+  "results": [
+    {
+      "index": 0,
+      "url": "https://bringatrailer.com/listing/2002-bmw-m3-convertible/",
+      "title": "2002 BMW M3 6-Speed Convertible",
+      "inferred_values": {
+        "engine": "3.2-Liter Inline Six",
+        "exterior_color": "Blue Topaz Metallic",
+        "seller_type": "Private Party",
+        "interior_color": "Dove grey"
+      },
+      "fields_inferred": [
+        "interior_color"
+      ],
+      "fields_skipped": [
+        "engine",
+        "exterior_color",
+        "seller_type"
+      ],
+      "error": null
+    },
+    {
+      "index": 1,
+      "url": "https://bringatrailer.com/listing/2004-bmw-m3-2/",
+      "title": "45K-Mile 2004 BMW M3 6-Speed",
+      "inferred_values": {
+        "engine": "Stock 3.2 Liter Inline 6-Cylinder",
+        "interior_color": "Imola red exterior and interior",
+        "exterior_color": "Imola Red",
+        "seller_type": "Dealer"
+      },
+      "fields_inferred": [
+        "exterior_color",
+        "seller_type"
+      ],
+      "fields_skipped": [
+        "engine",
+        "interior_color"
+      ],
+      "error": null
+    },
+    {
+      "index": 2,
+      "url": "https://bringatrailer.com/listing/2002-bmw-m3-3/",
+      "title": "Supercharged 2002 BMW M3 SMG",
+      "inferred_values": {
+        "engine": "Supercharged 3.2L S54 Inline-Six",
+        "exterior_color": "Titan Silver Metallic Paint",
+        "interior_color": "Jet Black Over Black Nappa Leather",
+        "seller_type": "Private Party"
+      },
+      "fields_inferred": [
+        "seller_type"
+      ],
+      "fields_skipped": [
+        "engine",
+        "exterior_color",
+        "interior_color"
+      ],
+      "error": null
+    },
+    {
+      "index": 3,
+      "url": "https://bringatrailer.com/listing/2005-bmw-m3-3/",
+      "title": "2005 BMW M3 6-Speed Competition Package",
+      "inferred_values": {
+        "engine": "S54 3.2L Inline-Six",
+        "exterior_color": "Interlagos Blue",
+        "interior_color": "black",
+        "seller_type": "Private Party"
+      },
+      "fields_inferred": [
+        "interior_color",
+        "seller_type"
+      ],
+      "fields_skipped": [
+        "engine",
+        "exterior_color"
+      ],
+      "error": null
+    },
+    {
+      "index": 4,
+      "url": "https://bringatrailer.com/listing/2004-bmw-m3-coupe/",
+      "title": "2004 BMW M3 Coupe SMG",
+      "inferred_values": {
+        "engine": "3.2 Liter Inline-Six",
+        "exterior_color": "Titanium Silver Metallic",
+        "interior_color": "Black Leather",
+        "seller_type": "Private Party"
+      },
+      "fields_inferred": [
+        "exterior_color",
+        "interior_color",
+        "seller_type"
+      ],
+      "fields_skipped": [
+        "engine"
+      ],
+      "error": null
+    },
+    {
+      "index": 5,
+      "url": "https://bringatrailer.com/listing/2001-bmw-m3-coupe/",
+      "title": "2001 BMW M3 Coupe 6-Speed",
+      "inferred_values": {
+        "engine": "3.2 Liter S54 Inline-Six",
+        "exterior_color": "Laguna Seca Blue",
+        "interior_color": null,
+        "seller_type": "Private Party"
+      },
+      "fields_inferred": [
+        "interior_color",
+        "seller_type"
+      ],
+      "fields_skipped": [
+        "engine",
+        "exterior_color"
+      ],
+      "error": null
+    },
+    {
+      "index": 6,
+      "url": "https://bringatrailer.com/listing/2002-bmw-m3-7/",
+      "title": "24K-Mile 2002 BMW M3 Coupe 6-Speed",
+      "inferred_values": {
+        "engine": "3.2 Liter S54 Inline-Six",
+        "exterior_color": "Titan Silver",
+        "interior_color": "Black",
+        "seller_type": "Dealer"
+      },
+      "fields_inferred": [
+        "exterior_color",
+        "interior_color",
+        "seller_type"
+      ],
+      "fields_skipped": [
+        "engine"
+      ],
+      "error": null
+    },
+    {
+      "index": 7,
+      "url": "https://bringatrailer.com/listing/2002-bmw-m3-6/",
+      "title": "Supercharged 2002 BMW M3 Coupe SMG",
+      "inferred_values": {
+        "engine": "3.2-liter Inline Six",
+        "exterior_color": "CSL Body Pieces and Black Trim",
+        "interior_color": "Imola Red",
+        "seller_type": "Private Party"
+      },
+      "fields_inferred": [
+        "interior_color",
+        "seller_type"
+      ],
+      "fields_skipped": [
+        "engine",
+        "exterior_color"
+      ],
+      "error": null
+    },
+    {
+      "index": 8,
+      "url": "https://bringatrailer.com/listing/2006-bmw-m3-convertible-2/",
+      "title": "59K-Mile 2006 BMW M3 Convertible 6-Speed",
+      "inferred_values": {
+        "engine": "BMW Rebuilt 3.2 Liter S54 Inline-Six",
+        "interior_color": "Carbon Black Metallic over Black Leather",
+        "exterior_color": "Carbon Black Metallic",
+        "seller_type": "Private Party"
+      },
+      "fields_inferred": [
+        "exterior_color",
+        "seller_type"
+      ],
+      "fields_skipped": [
+        "engine",
+        "interior_color"
+      ],
+      "error": null
+    }
+  ],
+  "errors": []
+}
