@@ -330,7 +330,7 @@ class TestCliUrlAndReset(CliCase):
         db = ActivityDB(self.db_path)
         for _ in range(3):
             db.mark_error(5000, 'http 404')
-        db.save_detail(ActivityParser(SELECTORS).parse_listing(listing_html(listing_id=5001, history=''), 'u'), 1, 3)
+        db.save_detail(ActivityParser(SELECTORS).parse_listing(listing_html(listing_id=5001, history=''), 'u'), 2_000_000_000, 3)
         db.mark_error(5001, 'fetched rows keep their attempts')
         self.assertEqual([r['listing_id'] for r in db.pending()], [5002])
         db.close()

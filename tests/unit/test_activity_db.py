@@ -11,6 +11,8 @@ from storage.activity_db import ActivityDB
 
 
 PV = 2
+# fetch times after every synthetic auction has ended, so no saved page looks like a pre-end snapshot
+SAVED = 2_000_000_000
 
 
 def url(listing_id):
@@ -70,30 +72,30 @@ class TestActivityDB(unittest.TestCase):
         self.db.upsert_summaries([summary(1, end_ts=10), summary(2, end_ts=20)], now=1)
         self.assertEqual([r['listing_id'] for r in self.db.pending()], [2, 1])
 
-        self.db.save_detail(detail(2, 'dealer', [('alice', 5000)]), now=5, parser_version=PV)
+        self.db.save_detail(detail(2, 'dealer', [('alice', 5000)]), now=SAVED + 5, parser_version=PV)
         for _ in range(3):
             self.db.mark_error(1, 'http 404')
         self.assertEqual(self.db.pending(), [])
 
     def test_upgrade_requeues_older_parser_versions(self):
         self.db.upsert_summaries([summary(1), summary(2)], now=1)
-        self.db.save_detail(detail(1, 'dealer', []), now=2, parser_version=1)
-        self.db.save_detail(detail(2, 'dealer', []), now=2, parser_version=2)
+        self.db.save_detail(detail(1, 'dealer', []), now=SAVED + 2, parser_version=1)
+        self.db.save_detail(detail(2, 'dealer', []), now=SAVED + 2, parser_version=2)
 
         self.assertEqual(self.db.pending(), [])
         self.assertEqual([r['listing_id'] for r in self.db.pending(upgrade_below=2)], [1])
 
     def test_refetch_replaces_bids(self):
         self.db.upsert_summaries([summary(1)], now=1)
-        self.db.save_detail(detail(1, 'dealer', [('alice', 1000), ('bob', 2000)]), now=2, parser_version=PV)
-        self.db.save_detail(detail(1, 'dealer', [('alice', 1000)]), now=3, parser_version=PV)
+        self.db.save_detail(detail(1, 'dealer', [('alice', 1000), ('bob', 2000)]), now=SAVED + 2, parser_version=PV)
+        self.db.save_detail(detail(1, 'dealer', [('alice', 1000)]), now=SAVED + 3, parser_version=PV)
         self.assertEqual(self.db.query("SELECT COUNT(*) AS n FROM bids")[0]['n'], 1)
 
     def test_member_activity_rollup(self):
         self.db.upsert_summaries([summary(i) for i in (1, 2, 3)], now=1)
-        self.db.save_detail(detail(1, 'dealer', [('alice', 1000), ('bob', 2000), ('alice', 3000)]), now=2, parser_version=PV)
-        self.db.save_detail(detail(2, 'dealer', [('bob', 5000)]), now=2, parser_version=PV)
-        self.db.save_detail(detail(3, 'alice', [('bob', 900)], result='reserve_not_met'), now=2, parser_version=PV)
+        self.db.save_detail(detail(1, 'dealer', [('alice', 1000), ('bob', 2000), ('alice', 3000)]), now=SAVED + 2, parser_version=PV)
+        self.db.save_detail(detail(2, 'dealer', [('bob', 5000)]), now=SAVED + 2, parser_version=PV)
+        self.db.save_detail(detail(3, 'alice', [('bob', 900)], result='reserve_not_met'), now=SAVED + 2, parser_version=PV)
 
         rows = {r['slug']: r for r in self.db.query("SELECT * FROM member_activity")}
 
@@ -109,26 +111,26 @@ class TestActivityDB(unittest.TestCase):
 
     def test_unknown_result_never_overwrites_a_known_one(self):
         self.db.upsert_summaries([summary(1)], now=1)
-        self.db.save_detail(detail(1, 'dealer', [('alice', 1000)]), now=2, parser_version=PV)
-        self.db.save_detail(detail(1, 'dealer', [('alice', 1000)], result='unknown'), now=3, parser_version=PV)
+        self.db.save_detail(detail(1, 'dealer', [('alice', 1000)]), now=SAVED + 2, parser_version=PV)
+        self.db.save_detail(detail(1, 'dealer', [('alice', 1000)], result='unknown'), now=SAVED + 3, parser_version=PV)
         self.assertEqual(self.db.query("SELECT result FROM auctions")[0]['result'], 'sold')
 
     def test_fields_a_page_didnt_yield_keep_their_stored_values(self):
         self.db.upsert_summaries([summary(1)], now=1)
-        self.db.save_detail(detail(1, 'dealer', [('alice', 1000)], vin='WBSBR934X2EX23144'), now=2, parser_version=PV)
+        self.db.save_detail(detail(1, 'dealer', [('alice', 1000)], vin='WBSBR934X2EX23144'), now=SAVED + 2, parser_version=PV)
         blank = detail(1, 'dealer', [('alice', 1000)])
         blank.seller = blank.make = blank.model_slug = blank.chassis = blank.vin = None
-        self.db.save_detail(blank, now=3, parser_version=PV)
+        self.db.save_detail(blank, now=SAVED + 3, parser_version=PV)
         row = self.db.query("SELECT seller_slug, make, model_slug, vin, fetched_at FROM auctions")[0]
-        self.assertEqual(tuple(row), ('dealer', 'BMW', 'bmw/model', 'WBSBR934X2EX23144', 3))
+        self.assertEqual(tuple(row), ('dealer', 'BMW', 'bmw/model', 'WBSBR934X2EX23144', SAVED + 3))
 
     def test_a_bid_stored_under_another_listing_is_refused(self):
         self.db.upsert_summaries([summary(1), summary(2)], now=1)
-        self.db.save_detail(detail(1, 'dealer', [('alice', 1000)]), now=2, parser_version=PV)
+        self.db.save_detail(detail(1, 'dealer', [('alice', 1000)]), now=SAVED + 2, parser_version=PV)
         other = detail(2, 'dealer', [('bob', 2000)])
         other.bids[0].bid_id = 100
         with self.assertRaises(ValueError) as ctx:
-            self.db.save_detail(other, now=3, parser_version=PV)
+            self.db.save_detail(other, now=SAVED + 3, parser_version=PV)
         self.assertIn('already stored under listing 1', str(ctx.exception))
         rows = {r['listing_id']: r for r in self.db.query("SELECT listing_id, fetched_at FROM auctions")}
         self.assertIsNone(rows[2]['fetched_at'])
@@ -139,6 +141,82 @@ class TestActivityDB(unittest.TestCase):
         self.db.mark_error(1, 'layout changed', count_attempt=False)
         row = self.db.query("SELECT fetch_attempts, fetch_error FROM auctions")[0]
         self.assertEqual(tuple(row), (0, 'layout changed'))
+
+    def test_rediscovery_keeps_what_the_page_said(self):
+        self.db.upsert_summaries([summary(1, high_bid=6000, end_ts=1000)], now=1)
+        page = detail(1, 'dealer', [('alice', 12000)], end_ts=1005)
+        page.title = 'Gilbert & Barker Pump'
+        self.db.save_detail(page, now=SAVED, parser_version=PV)
+
+        again = summary(1, result='sold', high_bid=6000, end_ts=1000)
+        again.title, again.url, again.no_reserve = 'Gilbert &#038; Barker Pump', url(1) + '?moved', True
+        self.db.upsert_summaries([again], now=SAVED + 1)
+        row = self.db.query("SELECT title, high_bid, end_ts, url, no_reserve FROM auctions")[0]
+        # discovery still owns the url and flags; the page owns title, price and end time
+        self.assertEqual(tuple(row), ('Gilbert & Barker Pump', 12000, 1005, url(1) + '?moved', 1))
+
+    def test_discovery_never_downgrades_a_known_result_to_unknown(self):
+        self.db.upsert_summaries([summary(1, result='sold')], now=1)
+        self.db.upsert_summaries([summary(1, result='unknown')], now=2)
+        self.assertEqual(self.db.query("SELECT result FROM auctions")[0]['result'], 'sold')
+
+    def test_a_result_that_changes_to_sold_is_requeued(self):
+        self.db.upsert_summaries([summary(1, result='reserve_not_met')], now=1)
+        self.db.save_detail(detail(1, 'dealer', [('alice', 9000)], result='reserve_not_met'), now=SAVED, parser_version=PV)
+        self.assertEqual(self.db.pending(now=SAVED), [])
+
+        # a post-auction deal: bat relabels the result
+        self.db.upsert_summaries([summary(1, result='sold')], now=SAVED + 1)
+        row = self.db.query("SELECT result, refetch, winner_slug FROM auctions")[0]
+        self.assertEqual(tuple(row), ('reserve_not_met', 1, None))
+        self.assertEqual([r['listing_id'] for r in self.db.pending(now=SAVED)], [1])
+
+        self.db.save_detail(detail(1, 'dealer', [('alice', 9000)], result='sold'), now=SAVED + 2, parser_version=PV)
+        self.assertEqual(tuple(self.db.query("SELECT result, refetch FROM auctions")[0]), ('sold', 0))
+        self.assertEqual(self.db.pending(now=SAVED), [])
+
+    def test_reserve_not_met_is_checked_once_more_after_the_deal_window(self):
+        end = 1_700_000_000
+        self.db.upsert_summaries([summary(1, result='reserve_not_met', end_ts=end)], now=1)
+        self.db.save_detail(detail(1, 'dealer', [('alice', 9000)], result='reserve_not_met', end_ts=end),
+                            now=end + 3600, parser_version=PV)
+        day = 86400
+        self.assertEqual(self.db.pending(now=end + 5 * day), [])
+        self.assertEqual([r['listing_id'] for r in self.db.pending(now=end + 11 * day)], [1])
+
+        self.db.save_detail(detail(1, 'dealer', [('alice', 9000)], result='reserve_not_met', end_ts=end),
+                            now=end + 11 * day, parser_version=PV)
+        self.assertEqual(self.db.pending(now=end + 30 * day), [])
+
+    def test_a_page_saved_before_its_auction_ended_is_requeued(self):
+        end = 1_700_000_000
+        self.db.upsert_summaries([summary(1, end_ts=end)], now=1)
+        self.db.save_detail(detail(1, 'dealer', [('alice', 9000)], end_ts=end), now=end - 3600, parser_version=PV)
+        self.assertEqual([r['listing_id'] for r in self.db.pending(now=end + 86400)], [1])
+        self.db.save_detail(detail(1, 'dealer', [('alice', 9000)], end_ts=end), now=end + 86400, parser_version=PV)
+        self.assertEqual(self.db.pending(now=end + 86400), [])
+
+    def test_a_url_collision_or_bad_item_doesnt_cost_the_page(self):
+        shared = summary(2)
+        shared.url = url(1)
+        broken = summary(3)
+        broken.url = None
+        skipped = []
+        new = self.db.upsert_summaries([summary(1), shared, broken, summary(4)], now=1, skipped=skipped)
+        self.assertEqual(new, 3)
+        self.assertEqual([r['listing_id'] for r in self.db.query("SELECT listing_id FROM auctions ORDER BY 1")], [1, 2, 4])
+        self.assertEqual([listing_id for listing_id, _ in skipped], [3])
+
+    def test_scoped_refetch_queues_listings_without_hiding_them(self):
+        self.db.upsert_summaries([summary(i) for i in (1, 2, 3)], now=1)
+        for i in (1, 2, 3):
+            self.db.save_detail(detail(i, 'dealer', [('alice', 1000)]), now=SAVED, parser_version=PV)
+        self.assertEqual(self.db.mark_stale([1, 2], fetched_before=SAVED + 1), 2)
+        rows = {r['listing_id']: r for r in self.db.query("SELECT listing_id, parser_version, fetched_at FROM auctions")}
+        self.assertEqual((rows[1]['parser_version'], rows[1]['fetched_at'], rows[3]['parser_version']), (0, SAVED, PV))
+        self.assertEqual({r['listing_id'] for r in self.db.pending(upgrade_below=PV, listing_ids=[1, 2, 3], now=SAVED)}, {1, 2})
+        # already re-fetched since the scope was queued: not queued again
+        self.assertEqual(self.db.mark_stale([1, 2], fetched_before=SAVED - 1), 0)
 
     def test_meta_roundtrip(self):
         self.assertIsNone(self.db.get_meta('backfill_next_page'))
@@ -159,7 +237,7 @@ class TestVehicleTracking(unittest.TestCase):
 
     def save(self, *details):
         for d in details:
-            self.db.save_detail(d, now=1, parser_version=PV)
+            self.db.save_detail(d, now=SAVED + 1, parser_version=PV)
         return self.db.rebuild_vehicles()
 
     def vehicle_ids(self):
@@ -207,7 +285,7 @@ class TestVehicleTracking(unittest.TestCase):
         # listing 2 links to an old url; fetching it redirected to the listing's current url
         self.save(detail(2, 'b', [('c', 200)], history=['https://bringatrailer.com/listing/old-slug/']))
         moved = detail(1, 'a', [('b', 100)])
-        self.db.save_detail(moved, now=1, parser_version=PV, requested_url='https://bringatrailer.com/listing/old-slug/')
+        self.db.save_detail(moved, now=SAVED + 1, parser_version=PV, requested_url='https://bringatrailer.com/listing/old-slug/')
         self.assertEqual(self.db.pending_history(), [])
         self.assertFalse(self.db.needs_fetch('https://bringatrailer.com/listing/old-slug/'))
 
@@ -216,6 +294,22 @@ class TestVehicleTracking(unittest.TestCase):
         for _ in range(3):
             self.db.mark_url_error(url(1), 'http 404')
         self.assertEqual(self.db.pending_history(max_attempts=3), [])
+        self.assertFalse(self.db.needs_fetch(url(1), max_attempts=3))
+        self.assertTrue(self.db.needs_fetch(url(1), max_attempts=4))
+
+    def test_refetching_a_listing_keeps_its_links_follow_attempts(self):
+        self.save(detail(2, 'b', [], history=[url(1), url(7)]))
+        self.db.mark_url_error(url(1), 'http 503')
+        self.db.mark_url_error(url(1), 'http 503')
+        self.save(detail(2, 'b', [], history=[url(1)]))
+        links = self.db.query("SELECT related_url, follow_attempts FROM listing_links")
+        self.assertEqual([(r['related_url'], r['follow_attempts']) for r in links], [(url(1), 2)])
+
+    def test_a_listing_that_ran_out_of_attempts_isnt_followed_again(self):
+        self.db.upsert_summaries([summary(1)], now=1)
+        for _ in range(3):
+            self.db.mark_error(1, 'http 404')
+        self.assertFalse(self.db.needs_fetch(url(1), max_attempts=3))
 
     def test_parts_listing_quoting_a_vin_doesnt_join_that_car(self):
         self.save(
@@ -291,6 +385,47 @@ class TestMigration(unittest.TestCase):
             self.assertIn('listed', view_columns)
 
             self.assertEqual([r['listing_id'] for r in db.pending(upgrade_below=PV)], [1])
+            db.close()
+
+    def test_drops_unique_url_from_an_existing_database(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'v1.db')
+            db = ActivityDB(path)
+            db.upsert_summaries([summary(1), summary(2)], now=1)
+            db.save_detail(detail(1, 'a', [('b', 100), ('c', 200)], history=[url(2)]), now=SAVED, parser_version=PV)
+            db.close()
+
+            # put the database back the way the first release left it: url UNIQUE, no schema version
+            conn = sqlite3.connect(path)
+            conn.executescript("""
+                PRAGMA foreign_keys=OFF;
+                CREATE TABLE auctions_v1 AS SELECT * FROM auctions;
+                DROP TABLE auctions;
+            """)
+            create = conn.execute("SELECT sql FROM sqlite_master WHERE name = 'auctions_v1'").fetchone()
+            columns = [r[1] for r in conn.execute("PRAGMA table_info(auctions_v1)")]
+            conn.executescript(f"""
+                CREATE TABLE auctions (listing_id INTEGER PRIMARY KEY, url TEXT NOT NULL UNIQUE,
+                    {', '.join(c for c in columns if c not in ('listing_id', 'url'))});
+                INSERT INTO auctions SELECT {', '.join(columns)} FROM auctions_v1;
+                DROP TABLE auctions_v1;
+                DELETE FROM meta WHERE key = 'schema_version';
+            """)
+            conn.close()
+            self.assertIsNotNone(create)
+
+            db = ActivityDB(path)
+            self.assertFalse(db._url_is_unique())
+            self.assertEqual(db.get_meta('schema_version'), '2')
+            self.assertEqual(db.query("SELECT COUNT(*) AS n FROM auctions")[0]['n'], 2)
+            self.assertEqual(db.query("SELECT COUNT(*) AS n FROM bids")[0]['n'], 2)
+            self.assertEqual(db.query("PRAGMA foreign_key_check"), [])
+            self.assertEqual(db.query("SELECT related_listing_id FROM listing_links")[0]['related_listing_id'], 2)
+            self.assertTrue(db.query("SELECT * FROM member_activity"))
+            # two listings may now share a url
+            other = summary(3)
+            other.url = url(1)
+            self.assertEqual(db.upsert_summaries([other], now=2), 1)
             db.close()
 
 

@@ -1,5 +1,9 @@
 import os
 import sys
+import json
+import time
+import hashlib
+import sqlite3
 import argparse
 from datetime import datetime, timezone
 
@@ -8,8 +12,9 @@ import yaml
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 
 from sites.bringatrailer.http_client import BaTClient, RateLimited, SiteUnavailable, listing_url
-from sites.bringatrailer.activity_parser import ActivityParser
+from sites.bringatrailer.activity_parser import ActivityParser, PARSER_VERSION
 from storage.activity_db import ActivityDB
+from storage.raw_store import RawStore, raw_db_path
 from pipelines.activity_pipeline import ActivityPipeline, CircuitOpen, fmt_ts
 
 
@@ -43,15 +48,47 @@ def load_config() -> dict:
         return yaml.safe_load(f)
 
 
-def build_pipeline(args, db: ActivityDB, config: dict) -> ActivityPipeline:
-    client = BaTClient(
-        base_url=config['site']['base_url'],
-        disallowed_paths=config['robots_txt']['disallowed_paths'],
-        crawl_delay=config['robots_txt']['crawl_delay'],
-        delay=args.delay
-    )
+def build_pipeline(args, db: ActivityDB, config: dict, raw_store: RawStore) -> ActivityPipeline:
+    client = None
+    if hasattr(args, 'delay'):
+        client = BaTClient(
+            base_url=config['site']['base_url'],
+            disallowed_paths=config['robots_txt']['disallowed_paths'],
+            crawl_delay=config['robots_txt']['crawl_delay'],
+            delay=args.delay
+        )
     parser = ActivityParser(config['activity']['selectors'])
-    return ActivityPipeline(client, parser, db, config['activity'])
+    return ActivityPipeline(client, parser, db, config['activity'], raw_store=raw_store)
+
+
+def scope_ids(args, db: ActivityDB, parser: argparse.ArgumentParser):
+    """listing ids from --where or --ids-from, or None when neither was given"""
+    if getattr(args, 'where', None):
+        try:
+            return db.listing_ids_where(args.where)
+        except sqlite3.Error as e:
+            parser.error(f"--where: {e}")
+    if getattr(args, 'ids_from', None):
+        ids = []
+        with open(args.ids_from) as f:
+            for n, line in enumerate(f, 1):
+                line = line.split('#', 1)[0].strip()
+                if not line:
+                    continue
+                if not line.isdigit():
+                    parser.error(f"--ids-from: line {n} is not a listing id: {line!r}")
+                ids.append(int(line))
+        return ids
+    return None
+
+
+def mark_scope_stale(db: ActivityDB, args, ids) -> int:
+    """queue a scope for re-fetching; rerunning the same scope after an interruption resumes instead of restarting"""
+    scope = args.where or 'ids:' + hashlib.sha1(','.join(map(str, sorted(ids))).encode()).hexdigest()
+    saved = json.loads(db.get_meta('refetch_scope') or '{}')
+    since = saved['since'] if saved.get('scope') == scope else int(time.time())
+    db.set_meta('refetch_scope', json.dumps({'scope': scope, 'since': since}))
+    return db.mark_stale(ids, fetched_before=since)
 
 
 def run_discover(args, pipeline: ActivityPipeline) -> dict:
@@ -68,16 +105,17 @@ def run_discover(args, pipeline: ActivityPipeline) -> dict:
     return stats
 
 
-def run_fetch(args, pipeline: ActivityPipeline, urls=None) -> dict:
+def run_fetch(args, pipeline: ActivityPipeline, urls=None, listing_ids=None) -> dict:
     print("fetching bid histories...")
     print("=" * 70)
     stats = pipeline.fetch(
         limit=args.limit,
         since_ts=parse_date(args.since) if args.since else None,
         max_attempts=args.max_attempts,
-        upgrade=args.upgrade,
+        upgrade=args.upgrade or listing_ids is not None,
         follow_history=not args.no_follow_history,
-        urls=urls
+        urls=urls,
+        listing_ids=listing_ids
     )
     print(f"\n{stats['fetched']} auction(s) saved, {stats['bids']} bids, "
           f"{stats['followed']} history links followed, {stats['failed']} failed")
@@ -164,16 +202,28 @@ def auction_filters(args, alias: str):
     return ''.join(f" AND {c}" for c in clauses), params
 
 
-def report_overview(db: ActivityDB):
+def report_overview(db: ActivityDB, raw_path=None):
     row = db.query("""
         SELECT
             COUNT(*) AS discovered,
             SUM(fetched_at IS NOT NULL) AS fetched,
             SUM(fetched_at IS NULL AND fetch_error IS NOT NULL) AS errored,
             SUM(bids_reported IS NOT NULL AND bids_reported != n_bids) AS bid_mismatches,
+            SUM(fetched_at IS NOT NULL AND (seller_slug IS NULL OR make IS NULL OR result IS NULL OR result = 'unknown')) AS incomplete,
+            SUM(refetch = 1) AS flagged,
             MIN(CASE WHEN fetched_at IS NOT NULL THEN end_ts END) AS first_ts,
             MAX(CASE WHEN fetched_at IS NOT NULL THEN end_ts END) AS last_ts
         FROM auctions
+    """)[0]
+    # the stored bids against the auction rows that describe them
+    bid_rows = db.query("""
+        SELECT
+            SUM(COALESCE(b.n, 0) != COALESCE(a.n_bids, 0)) AS count_differs,
+            SUM(a.high_bid > b.top) AS price_above_top_bid
+        FROM auctions a
+        LEFT JOIN (SELECT listing_id, COUNT(*) AS n, MAX(amount) AS top FROM bids GROUP BY listing_id) b
+            ON b.listing_id = a.listing_id
+        WHERE a.fetched_at IS NOT NULL
     """)[0]
     counts = db.query("SELECT (SELECT COUNT(*) FROM members) AS members, (SELECT COUNT(*) FROM bids) AS bids")[0]
     vehicles = db.query("""
@@ -191,7 +241,11 @@ def report_overview(db: ActivityDB):
     print(f"  auctions discovered : {row['discovered'] or 0:,}")
     print(f"  with bid history    : {row['fetched'] or 0:,} ({fmt_ts(row['first_ts'])} to {fmt_ts(row['last_ts'])})")
     print(f"  fetch errors        : {row['errored'] or 0:,}")
-    print(f"  bid count mismatches: {row['bid_mismatches'] or 0:,}")
+    print(f"  bid count mismatches: {row['bid_mismatches'] or 0:,} (page counter vs parsed bids)")
+    print(f"  bid rows vs n_bids  : {bid_rows['count_differs'] or 0:,} differ")
+    print(f"  price above top bid : {bid_rows['price_above_top_bid'] or 0:,} (post-auction deals, or a parse problem)")
+    print(f"  incomplete rows     : {row['incomplete'] or 0:,} fetched without a seller, make or known result")
+    print(f"  flagged to re-fetch : {row['flagged'] or 0:,} (discovery says the result changed)")
     print(f"  members             : {counts['members']:,}")
     print(f"  bids                : {counts['bids']:,}")
     print(f"  vehicles tracked    : {vehicles['vehicles'] or 0:,} ({vehicles['repeat_vehicles'] or 0:,} auctioned more than once)")
@@ -212,6 +266,15 @@ def report_overview(db: ActivityDB):
         WHERE a.fetched_at IS NOT NULL
     """)[0]
     print(f"  seller/buyer check  : {checks['checked'] or 0:,} sales checked against bat history, {checks['disagree'] or 0:,} disagree")
+
+    if raw_path and os.path.exists(raw_path):
+        store = RawStore(raw_path)
+        try:
+            stats = store.stats()
+        finally:
+            store.close()
+        parts = [f"{v['pages']:,} {kind} ({v['bytes'] / 1e6:,.1f} MB)" for kind, v in sorted(stats.items())]
+        print(f"  stored pages        : {', '.join(parts) or 'none'}")
 
 
 def report_leaderboards(db: ActivityDB, args):
@@ -438,6 +501,14 @@ def add_discover_args(p):
                    help='incremental mode: stop after this many pages with no new auctions')
 
 
+def add_scope_args(p, verb):
+    scope = p.add_mutually_exclusive_group()
+    scope.add_argument('--where', help=f"{verb} the listings matching this sql condition on the auctions table, "
+                                       "e.g. \"make = 'Porsche' AND end_ts < 1600000000\"")
+    scope.add_argument('--ids-from', metavar='FILE', help=f'{verb} the listing ids in this file, one per line')
+    return scope
+
+
 def add_fetch_args(p):
     p.add_argument('--limit', type=int, help='fetch at most this many listing pages')
     p.add_argument('--max-attempts', type=int, default=3, help='give up on a listing after this many failures')
@@ -450,6 +521,7 @@ def add_fetch_args(p):
 def main(argv=None):
     parser = argparse.ArgumentParser(description='track who sells, bids on and wins bringatrailer auctions')
     parser.add_argument('--db', default=DEFAULT_DB, help='sqlite database path')
+    parser.add_argument('--raw-db', help='where fetched pages are kept for reparse (default: next to --db, as <name>_raw.db)')
     sub = parser.add_subparsers(dest='command', required=True)
 
     discover = sub.add_parser('discover', help='page through completed auction results')
@@ -457,7 +529,8 @@ def main(argv=None):
 
     fetch = sub.add_parser('fetch', help='download bid histories for discovered auctions')
     add_fetch_args(fetch)
-    fetch.add_argument('--url', nargs='+', help='fetch these listing urls (and their bat history) instead of the queue')
+    scope = add_scope_args(fetch, 're-fetch')
+    scope.add_argument('--url', nargs='+', help='fetch these listing urls (and their bat history) instead of the queue')
 
     sync = sub.add_parser('sync', help='discover new results, then fetch their bid histories')
     add_discover_args(sync)
@@ -468,6 +541,8 @@ def main(argv=None):
         p.add_argument('--delay', type=float, default=3.0, help='seconds between requests (robots crawl-delay is the floor)')
 
     sub.add_parser('link', help='regroup fetched auctions into vehicles by vin and bat history (no network)')
+    reparse = sub.add_parser('reparse', help='run the current parser over stored pages again (no network)')
+    add_scope_args(reparse, 'reparse')
     sub.add_parser('reset-errors',
                    help='clear failure counts so listings and history links that hit --max-attempts are tried again (no network)')
 
@@ -493,6 +568,8 @@ def main(argv=None):
             parser.error(f"--url: {e}")
 
     db = ActivityDB(args.db)
+    raw_path = args.raw_db or raw_db_path(args.db)
+    raw_store = None
 
     try:
         if args.command == 'link':
@@ -513,18 +590,38 @@ def main(argv=None):
             elif args.pairs:
                 report_pairs(db, args)
             else:
-                report_overview(db)
+                report_overview(db, raw_path)
                 report_leaderboards(db, args)
             print()
             return 0
 
-        pipeline = build_pipeline(args, db, config)
+        if args.command == 'reparse':
+            if not raw_path or not os.path.exists(raw_path):
+                print(f"no stored pages at {raw_path}; only listings fetched with the raw store can be reparsed")
+                return 1
+            raw_store = RawStore(raw_path)
+            pipeline = build_pipeline(args, db, config, raw_store)
+            print("reparsing stored pages...")
+            print("=" * 70)
+            stats = pipeline.reparse(scope_ids(args, db, parser))
+            print(f"\n{stats['reparsed']:,} listing(s) reparsed, {stats['failed']:,} failed")
+            print_vehicle_stats(stats['vehicles'])
+            return 1 if stats['failed'] and not stats['reparsed'] else 0
+
+        raw_store = RawStore(raw_path) if raw_path and args.command in ('fetch', 'sync') else None
+        pipeline = build_pipeline(args, db, config, raw_store)
         status = 0
         try:
             if args.command in ('discover', 'sync'):
                 run_discover(args, pipeline)
             if args.command in ('fetch', 'sync'):
-                stats = run_fetch(args, pipeline, urls)
+                ids = scope_ids(args, db, parser)
+                if ids is not None:
+                    marked = mark_scope_stale(db, args, ids)
+                    print(f"{len(ids):,} listing(s) in scope, {marked:,} newly queued for a re-fetch")
+                stats = run_fetch(args, pipeline, urls, ids)
+                if ids is not None and not db.pending(max_attempts=args.max_attempts, upgrade_below=PARSER_VERSION, listing_ids=ids):
+                    db.delete_meta('refetch_scope')
                 if stats['fetched'] == 0 and stats['failed'] > 0:
                     status = 1
         except KeyboardInterrupt:
@@ -542,6 +639,8 @@ def main(argv=None):
         return status
     finally:
         db.close()
+        if raw_store:
+            raw_store.close()
 
 
 if __name__ == '__main__':

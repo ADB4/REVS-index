@@ -1,7 +1,9 @@
 import os
+import json
+import time
 import sqlite3
 from collections import defaultdict
-from typing import List, Optional
+from typing import Iterable, List, Optional
 
 from core.models.activity import AuctionSummary, AuctionDetail, Member
 
@@ -21,16 +23,11 @@ def vehicle_key(vin: Optional[str], chassis: Optional[str], make: Optional[str])
     return None
 
 
-TABLES = """
-CREATE TABLE IF NOT EXISTS members (
-    slug TEXT PRIMARY KEY,
-    display_name TEXT,
-    user_id INTEGER
-);
-
+# the listing id is the key; a url can move between listings (renames, relists), so it isn't unique
+AUCTIONS_TABLE = """
 CREATE TABLE IF NOT EXISTS auctions (
     listing_id INTEGER PRIMARY KEY,
-    url TEXT NOT NULL UNIQUE,
+    url TEXT NOT NULL,
     title TEXT,
     year INTEGER,
     make TEXT,
@@ -63,10 +60,20 @@ CREATE TABLE IF NOT EXISTS auctions (
     discovered_at INTEGER,
     fetched_at INTEGER,
     parser_version INTEGER,
+    -- discovery saw the result change after the page was fetched
+    refetch INTEGER NOT NULL DEFAULT 0,
     fetch_attempts INTEGER NOT NULL DEFAULT 0,
     fetch_error TEXT
 );
+"""
 
+TABLES = """
+CREATE TABLE IF NOT EXISTS members (
+    slug TEXT PRIMARY KEY,
+    display_name TEXT,
+    user_id INTEGER
+);
+""" + AUCTIONS_TABLE + """
 CREATE TABLE IF NOT EXISTS bids (
     bid_id INTEGER PRIMARY KEY,
     listing_id INTEGER NOT NULL REFERENCES auctions(listing_id),
@@ -101,7 +108,16 @@ ADDED_COLUMNS = [
     ('auctions', 'vehicle_id', 'INTEGER'),
     ('auctions', 'parser_version', 'INTEGER'),
     ('auctions', 'chassis_raw', 'TEXT'),
+    ('auctions', 'refetch', 'INTEGER NOT NULL DEFAULT 0'),
 ]
+
+# 2: auctions.url no longer UNIQUE
+SCHEMA_VERSION = 2
+
+# a reserve-not-met auction can still sell in a post-auction deal; look once more after this long
+REFETCH_GRACE = 10 * 86400
+# a page saved before, or just as, its auction ended may not be final
+FROZEN_MARGIN = 600
 
 INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_auctions_seller ON auctions(seller_slug);
@@ -111,6 +127,7 @@ CREATE INDEX IF NOT EXISTS idx_auctions_model ON auctions(model_slug);
 CREATE INDEX IF NOT EXISTS idx_auctions_pending ON auctions(fetched_at, fetch_attempts);
 CREATE INDEX IF NOT EXISTS idx_auctions_vin ON auctions(vin);
 CREATE INDEX IF NOT EXISTS idx_auctions_vehicle ON auctions(vehicle_id);
+CREATE INDEX IF NOT EXISTS idx_auctions_url ON auctions(url);
 CREATE INDEX IF NOT EXISTS idx_bids_bidder ON bids(bidder_slug);
 CREATE INDEX IF NOT EXISTS idx_bids_listing ON bids(listing_id);
 CREATE INDEX IF NOT EXISTS idx_links_related_url ON listing_links(related_url);
@@ -284,9 +301,11 @@ class ActivityDB:
         self.conn.execute('PRAGMA journal_mode=WAL')
         self.conn.execute('PRAGMA foreign_keys=ON')
 
+        self.conn.executescript(TABLES)
         with self.conn:
-            self.conn.executescript(TABLES)
             self._add_missing_columns()
+        self._migrate()
+        with self.conn:
             self.conn.executescript(INDEXES)
             for name, sql in VIEWS.items():
                 self.conn.execute(f"DROP VIEW IF EXISTS {name}")
@@ -295,38 +314,60 @@ class ActivityDB:
     def close(self):
         self.conn.close()
 
-    def upsert_summaries(self, summaries: List[AuctionSummary], now: int) -> int:
+    def upsert_summaries(self, summaries: List[AuctionSummary], now: int, skipped: Optional[list] = None) -> int:
+        """store discovered auctions; returns how many were new. an item that can't be stored is appended to
+        skipped as (listing_id, error) instead of rolling back the rest of the page"""
         known = self.known_listing_ids([s.listing_id for s in summaries])
+        stored = []
 
         with self.conn:
+            self.conn.execute("BEGIN")
             for s in summaries:
-                self.conn.execute("""
-                    INSERT INTO auctions (
-                        listing_id, url, title, year, country_code, no_reserve, premium,
-                        result, high_bid, currency, end_ts, discovered_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(listing_id) DO UPDATE SET
-                        url = excluded.url,
-                        title = excluded.title,
-                        year = COALESCE(auctions.year, excluded.year),
-                        country_code = excluded.country_code,
-                        no_reserve = excluded.no_reserve,
-                        premium = excluded.premium,
-                        result = COALESCE(excluded.result, auctions.result),
-                        high_bid = COALESCE(excluded.high_bid, auctions.high_bid),
-                        currency = COALESCE(excluded.currency, auctions.currency),
-                        end_ts = COALESCE(excluded.end_ts, auctions.end_ts)
-                """, (
-                    s.listing_id, s.url, s.title, s.year, s.country_code, int(s.no_reserve), int(s.premium),
-                    s.result, s.high_bid, s.currency, s.end_ts, now
-                ))
+                self.conn.execute("SAVEPOINT summary")
+                try:
+                    # once a page has been fetched its own title, result, price and end time win:
+                    # discovery only fills gaps and flags a later change to "sold" for a re-fetch
+                    self.conn.execute("""
+                        INSERT INTO auctions (
+                            listing_id, url, title, year, country_code, no_reserve, premium,
+                            result, high_bid, currency, end_ts, discovered_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(listing_id) DO UPDATE SET
+                            url = excluded.url,
+                            title = CASE WHEN auctions.fetched_at IS NULL THEN excluded.title
+                                         ELSE COALESCE(auctions.title, excluded.title) END,
+                            year = COALESCE(auctions.year, excluded.year),
+                            country_code = excluded.country_code,
+                            no_reserve = excluded.no_reserve,
+                            premium = excluded.premium,
+                            result = CASE WHEN auctions.fetched_at IS NULL THEN COALESCE(NULLIF(excluded.result, 'unknown'), auctions.result, excluded.result)
+                                          ELSE COALESCE(auctions.result, excluded.result) END,
+                            high_bid = CASE WHEN auctions.fetched_at IS NULL THEN COALESCE(excluded.high_bid, auctions.high_bid)
+                                            ELSE COALESCE(auctions.high_bid, excluded.high_bid) END,
+                            currency = CASE WHEN auctions.fetched_at IS NULL THEN COALESCE(excluded.currency, auctions.currency)
+                                            ELSE COALESCE(auctions.currency, excluded.currency) END,
+                            end_ts = CASE WHEN auctions.fetched_at IS NULL THEN COALESCE(excluded.end_ts, auctions.end_ts)
+                                          ELSE COALESCE(auctions.end_ts, excluded.end_ts) END,
+                            refetch = CASE WHEN auctions.fetched_at IS NOT NULL AND excluded.result = 'sold'
+                                                AND COALESCE(auctions.result, '') != 'sold' THEN 1
+                                           ELSE auctions.refetch END
+                    """, (
+                        s.listing_id, s.url, s.title, s.year, s.country_code, int(s.no_reserve), int(s.premium),
+                        s.result, s.high_bid, s.currency, s.end_ts, now
+                    ))
+                    self.conn.execute("""
+                        UPDATE listing_links SET related_listing_id = ?
+                        WHERE related_url = ? AND related_listing_id IS NULL
+                    """, (s.listing_id, s.url))
+                except sqlite3.Error as e:
+                    self.conn.execute("ROLLBACK TO summary")
+                    if skipped is not None:
+                        skipped.append((s.listing_id, str(e)))
+                else:
+                    stored.append(s)
+                self.conn.execute("RELEASE summary")
 
-            self.conn.executemany("""
-                UPDATE listing_links SET related_listing_id = ?
-                WHERE related_url = ? AND related_listing_id IS NULL
-            """, [(s.listing_id, s.url) for s in summaries])
-
-        return len([s for s in summaries if s.listing_id not in known])
+        return len([s for s in stored if s.listing_id not in known])
 
     def save_detail(self, detail: AuctionDetail, now: int, parser_version: int, requested_url: Optional[str] = None) -> None:
         """store a parsed listing; requested_url is the url fetched, when a redirect or canonical link differs"""
@@ -360,6 +401,7 @@ class ActivityDB:
                     n_bids = ?, bids_reported = ?, n_comments = ?,
                     fetched_at = ?,
                     parser_version = ?,
+                    refetch = 0,
                     fetch_attempts = 0,
                     fetch_error = NULL
                 WHERE listing_id = ?
@@ -396,10 +438,18 @@ class ActivityDB:
                         raise
                     raise ValueError(f"bid {b.bid_id} is already stored under listing {owner['listing_id']}") from e
 
-            self.conn.execute("DELETE FROM listing_links WHERE listing_id = ?", (detail.listing_id,))
+            # links the page no longer shows go; the rest keep their follow attempts
+            self.conn.execute("""
+                DELETE FROM listing_links
+                WHERE listing_id = ? AND related_url NOT IN (SELECT value FROM json_each(?))
+            """, (detail.listing_id, json.dumps([h.url for h in detail.history])))
             self.conn.executemany("""
-                INSERT OR REPLACE INTO listing_links (listing_id, related_url, related_listing_id, related_end_ts, summary)
-                VALUES (?, ?, (SELECT listing_id FROM auctions WHERE url = ?), ?, ?)
+                INSERT INTO listing_links (listing_id, related_url, related_listing_id, related_end_ts, summary)
+                VALUES (?, ?, (SELECT listing_id FROM auctions WHERE url = ? ORDER BY fetched_at IS NULL, listing_id LIMIT 1), ?, ?)
+                ON CONFLICT(listing_id, related_url) DO UPDATE SET
+                    related_listing_id = COALESCE(excluded.related_listing_id, listing_links.related_listing_id),
+                    related_end_ts = excluded.related_end_ts,
+                    summary = excluded.summary
             """, [(detail.listing_id, h.url, h.url, h.end_ts, h.summary) for h in detail.history])
 
             # other listings may already point here, possibly under an older url for this listing
@@ -447,21 +497,36 @@ class ActivityDB:
         limit: Optional[int] = None,
         since_ts: Optional[int] = None,
         max_attempts: int = 3,
-        upgrade_below: Optional[int] = None
+        upgrade_below: Optional[int] = None,
+        listing_ids: Optional[Iterable[int]] = None,
+        now: Optional[float] = None,
+        grace: int = REFETCH_GRACE
     ) -> List[sqlite3.Row]:
-        stale = " OR COALESCE(parser_version, 0) < ?" if upgrade_below else ""
+        """listings to fetch: never fetched, flagged for a re-fetch, possibly saved before they were final,
+        reserve-not-met ones whose deal window has passed, and (with upgrade_below) older parser versions"""
+        stale = " OR COALESCE(parser_version, 0) < :upgrade" if upgrade_below else ""
         sql = f"""
             SELECT listing_id, url, end_ts FROM auctions
-            WHERE fetch_attempts < ? AND (fetched_at IS NULL{stale})
+            WHERE fetch_attempts < :max_attempts AND (
+                fetched_at IS NULL
+                OR refetch = 1
+                OR fetched_at < end_ts + :frozen
+                OR (result = 'reserve_not_met' AND fetched_at < end_ts + :grace AND end_ts < :now - :grace)
+                {stale}
+            )
         """
-        params = [max_attempts] + ([upgrade_below] if upgrade_below else [])
+        params = {'max_attempts': max_attempts, 'upgrade': upgrade_below, 'frozen': FROZEN_MARGIN, 'grace': grace,
+                  'now': int(time.time() if now is None else now)}
         if since_ts:
-            sql += " AND end_ts >= ?"
-            params.append(since_ts)
+            sql += " AND end_ts >= :since"
+            params['since'] = since_ts
+        if listing_ids is not None:
+            sql += " AND listing_id IN (SELECT value FROM json_each(:ids))"
+            params['ids'] = json.dumps(list(listing_ids))
         sql += " ORDER BY fetched_at IS NOT NULL, end_ts DESC"
-        if limit:
-            sql += " LIMIT ?"
-            params.append(limit)
+        if limit is not None:
+            sql += " LIMIT :limit"
+            params['limit'] = limit
         return self.conn.execute(sql, params).fetchall()
 
     def pending_history(self, max_attempts: int = 3) -> List[sqlite3.Row]:
@@ -474,14 +539,29 @@ class ActivityDB:
             ORDER BY MAX(related_end_ts) DESC
         """, (max_attempts,)).fetchall()
 
-    def needs_fetch(self, url: str) -> bool:
+    def needs_fetch(self, url: str, max_attempts: int = 3) -> bool:
+        """whether a linked url is worth a request: not fetched yet, and not given up on"""
         row = self.conn.execute("""
-            SELECT 1 FROM auctions
-            WHERE fetched_at IS NOT NULL
-              AND (url = ? OR listing_id IN (SELECT related_listing_id FROM listing_links WHERE related_url = ?))
-            LIMIT 1
-        """, (url, url)).fetchone()
-        return row is None
+            SELECT
+                EXISTS (SELECT 1 FROM auctions WHERE fetched_at IS NOT NULL AND (url = :url
+                        OR listing_id IN (SELECT related_listing_id FROM listing_links WHERE related_url = :url))) AS fetched,
+                EXISTS (SELECT 1 FROM auctions WHERE url = :url AND fetch_attempts >= :max) AS gave_up,
+                COALESCE((SELECT MAX(follow_attempts) FROM listing_links WHERE related_url = :url), 0) >= :max AS gave_up_following
+        """, {'url': url, 'max': max_attempts}).fetchone()
+        return not (row['fetched'] or row['gave_up'] or row['gave_up_following'])
+
+    def listing_ids_where(self, where: str) -> List[int]:
+        """listing ids matching a sql condition on auctions, for scoped re-fetches and reparses"""
+        return [r[0] for r in self.conn.execute(f"SELECT listing_id FROM auctions WHERE {where}")]
+
+    def mark_stale(self, listing_ids: Iterable[int], fetched_before: Optional[int] = None) -> int:
+        """queue fetched listings for a re-fetch without hiding them: parser_version goes to 0, fetched_at stays"""
+        with self.conn:
+            return self.conn.execute("""
+                UPDATE auctions SET parser_version = 0
+                WHERE fetched_at IS NOT NULL AND fetched_at < :before AND COALESCE(parser_version, -1) != 0
+                  AND listing_id IN (SELECT value FROM json_each(:ids))
+            """, {'ids': json.dumps(list(listing_ids)), 'before': fetched_before or 2 ** 62}).rowcount
 
     def rebuild_vehicles(self) -> dict:
         """group auctions into vehicles: same vin (or make + short chassis), or linked by bat history"""
@@ -574,8 +654,49 @@ class ActivityDB:
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value
             """, (key, value))
 
+    def delete_meta(self, key: str) -> None:
+        with self.conn:
+            self.conn.execute("DELETE FROM meta WHERE key = ?", (key,))
+
     def query(self, sql: str, params=()) -> List[sqlite3.Row]:
         return self.conn.execute(sql, params).fetchall()
+
+    def _migrate(self) -> None:
+        version = int(self.get_meta('schema_version') or 1)
+        if version < 2 and self._url_is_unique():
+            self._rebuild_auctions()
+        if version < SCHEMA_VERSION:
+            self.set_meta('schema_version', str(SCHEMA_VERSION))
+
+    def _url_is_unique(self) -> bool:
+        for index in self.conn.execute("PRAGMA index_list(auctions)").fetchall():
+            columns = [r['name'] for r in self.conn.execute(f"PRAGMA index_info('{index['name']}')")]
+            if index['unique'] and columns == ['url']:
+                return True
+        return False
+
+    def _rebuild_auctions(self) -> None:
+        """sqlite can't drop a constraint in place: copy auctions into a table without it"""
+        old_columns = [r['name'] for r in self.conn.execute("PRAGMA table_info(auctions)")]
+        rebuilt = AUCTIONS_TABLE.replace('CREATE TABLE IF NOT EXISTS auctions', 'CREATE TABLE auctions_rebuilt')
+        self.conn.execute(rebuilt)
+        new_columns = {r['name'] for r in self.conn.execute("PRAGMA table_info(auctions_rebuilt)")}
+        self.conn.execute("DROP TABLE auctions_rebuilt")
+        columns = ', '.join(c for c in old_columns if c in new_columns)
+
+        views = ''.join(f"DROP VIEW IF EXISTS {name};" for name in VIEWS)
+        # foreign keys from bids and listing_links stay pointed at "auctions" across the swap
+        self.conn.executescript(f"""
+            PRAGMA foreign_keys=OFF;
+            BEGIN;
+            {views}
+            {rebuilt};
+            INSERT INTO auctions_rebuilt ({columns}) SELECT {columns} FROM auctions;
+            DROP TABLE auctions;
+            ALTER TABLE auctions_rebuilt RENAME TO auctions;
+            COMMIT;
+            PRAGMA foreign_keys=ON;
+        """)
 
     def _add_missing_columns(self) -> None:
         for table, column, column_type in ADDED_COLUMNS:

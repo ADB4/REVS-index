@@ -7,6 +7,7 @@ from sites.bringatrailer.activity_parser import (
     ActivityParser, ListingParseError, NotFinal, PARSER_VERSION, parse_results_page
 )
 from storage.activity_db import ActivityDB
+from storage.raw_store import RawStore
 
 
 # a block or an outage shows up as a run of site-level failures, a markup change as a run of pages
@@ -47,11 +48,13 @@ class ActivityPipeline:
         activity_config: dict,
         max_site_failures: int = MAX_SITE_FAILURES_IN_A_ROW,
         max_failures: int = MAX_FAILURES_IN_A_ROW,
-        max_unmarked_ended: int = MAX_UNMARKED_ENDED_IN_A_ROW
+        max_unmarked_ended: int = MAX_UNMARKED_ENDED_IN_A_ROW,
+        raw_store: Optional[RawStore] = None
     ):
         self.client = client
         self.parser = parser
         self.db = db
+        self.raw_store = raw_store
         self.endpoint = activity_config['results_endpoint']
         self.per_page = activity_config['results_per_page']
         self.sort = activity_config['results_sort']
@@ -89,7 +92,13 @@ class ActivityPipeline:
                 print("  no more results")
                 break
 
-            new = self.db.upsert_summaries(summaries, int(time.time()))
+            skipped = []
+            new = self.db.upsert_summaries(summaries, int(time.time()), skipped)
+            unreadable = len(data.get('items', [])) - len(summaries)
+            if unreadable:
+                print(f"    {unreadable} item(s) on page {page} had no usable id or url")
+            for listing_id, error in skipped:
+                print(f"    couldn't store listing {listing_id}: {error}")
             new_total += new
             seen_total += len(summaries)
             pages_done += 1
@@ -126,14 +135,17 @@ class ActivityPipeline:
         max_attempts: int = 3,
         upgrade: bool = False,
         follow_history: bool = True,
-        urls: Optional[List[str]] = None
+        urls: Optional[List[str]] = None,
+        listing_ids: Optional[List[int]] = None
     ) -> dict:
+        """listing_ids limits the queue to those listings (a scoped re-fetch); links found on them are still followed"""
         if urls:
             queue = [{'listing_id': None, 'url': url, 'end_ts': None} for url in urls]
         else:
-            rows = self.db.pending(limit, since_ts, max_attempts, upgrade_below=PARSER_VERSION if upgrade else None)
+            rows = self.db.pending(limit, since_ts, max_attempts, upgrade_below=PARSER_VERSION if upgrade else None,
+                                   listing_ids=listing_ids)
             queue = [dict(r) for r in rows]
-            if follow_history:
+            if follow_history and listing_ids is None:
                 queue += [dict(r) for r in self.db.pending_history(max_attempts)]
 
         queued = set()
@@ -162,7 +174,7 @@ class ActivityPipeline:
                 now = time.time()
 
                 try:
-                    detail = self._fetch_listing(row['url'], now)
+                    page, detail, fragments = self._fetch_listing(row['url'], now)
 
                     # never file one listing's page under another listing's id
                     if row['listing_id'] and detail.listing_id != row['listing_id']:
@@ -173,6 +185,7 @@ class ActivityPipeline:
                     if detail.bids_reported is not None and detail.bids_reported != len(detail.bids):
                         print(f"    bid count mismatch for {row['url']}: page says {detail.bids_reported}, parsed {len(detail.bids)}")
 
+                    self._store_raw(page, detail, fragments, now)
                     self.db.save_detail(detail, int(now), PARSER_VERSION, requested_url=row['url'])
                     fetched += 1
                     bids += len(detail.bids)
@@ -181,7 +194,7 @@ class ActivityPipeline:
                     # earlier (or later) auctions of the same car, so its ownership chain is complete
                     if follow_history:
                         for link in detail.history:
-                            if link.url not in queued and self.db.needs_fetch(link.url):
+                            if link.url not in queued and self.db.needs_fetch(link.url, max_attempts):
                                 queue.append({'listing_id': None, 'url': link.url, 'end_ts': link.end_ts})
                                 queued.add(link.url)
                                 followed += 1
@@ -241,17 +254,54 @@ class ActivityPipeline:
         return {'fetched': fetched, 'failed': failed, 'not_final': not_final, 'bids': bids, 'followed': followed,
                 'vehicles': vehicles}
 
+    def reparse(self, listing_ids: Optional[List[int]] = None) -> dict:
+        """run the current parser over stored pages, offline; each listing keeps the time it was fetched"""
+        reparsed = 0
+        failed = 0
+        try:
+            for raw in self.raw_store.pages(listing_ids):
+                try:
+                    detail = self.parser.parse_listing(raw.html, raw.url, now=raw.fetched_at)
+                    if detail.listing_id != raw.listing_id:
+                        raise ListingMismatch(f"stored page is listing {detail.listing_id}")
+                    self.db.save_detail(detail, raw.fetched_at, PARSER_VERSION)
+                    reparsed += 1
+                except Exception as e:
+                    failed += 1
+                    print(f"    listing {raw.listing_id} ({raw.kind}): {e}")
+                if (reparsed + failed) % 1000 == 0:
+                    print(f"  reparsed {reparsed + failed} ({failed} failed)")
+        finally:
+            vehicles = self.db.rebuild_vehicles()
+        return {'reparsed': reparsed, 'failed': failed, 'vehicles': vehicles}
+
     def _fetch_listing(self, url: str, now: float):
         page = self.client.get_page(url)
         try:
             # parsed against the url that answered, after any redirects
-            return self.parser.parse_listing(page.text, page.url, now=now)
+            if self.raw_store:
+                detail, fragments = self.parser.parse_with_fragments(page.text, page.url, now=now)
+            else:
+                detail, fragments = self.parser.parse_listing(page.text, page.url, now=now), None
+            return page, detail, fragments
         except ListingParseError:
             # a challenge or block page comes back as a 200 that just doesn't parse
             marker = challenge_marker(page.text)
             if marker:
                 raise SiteUnavailable(f"{url} served a challenge page ({marker!r})")
             raise
+
+    def _store_raw(self, page, detail, fragments: Optional[str], now: float):
+        """keep what the parser read, so a later parser fix can be applied without downloading the page again.
+        the fragments are kept only if parsing them gives exactly this result; otherwise the whole page is"""
+        if not self.raw_store:
+            return
+        try:
+            same = self.parser.parse_listing(fragments, page.url, now=now) == detail
+        except Exception:
+            same = False
+        kind, html = ('fragments', fragments) if same else ('page', page.text)
+        self.raw_store.put(detail.listing_id, page.url, int(now), PARSER_VERSION, kind, html)
 
     def _record_failure(self, row: dict, error: Exception, count_attempt: bool):
         if row['listing_id']:

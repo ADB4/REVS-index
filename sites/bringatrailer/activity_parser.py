@@ -13,6 +13,12 @@ from extractors.field_extractors.vin_extractor import VINExtractor
 # bump when the parser starts capturing new fields, so `fetch --upgrade` knows what to re-fetch
 PARSER_VERSION = 3
 
+# selectors parse_listing applies to the whole page; the rest are only read inside what these match
+PAGE_LEVEL_SELECTORS = (
+    'listing_id', 'title', 'country', 'result_info', 'bid_count', 'winner_link', 'essentials', 'group_link',
+    'listing_details', 'history_item', 'ended_marker', 'canonical'
+)
+
 # selectors parse_listing can't work without; a missing one is a config error, not a bad page
 REQUIRED_SELECTORS = (
     'comments_var', 'listing_id', 'title', 'country', 'result_info', 'bid_count', 'winner_link', 'essentials',
@@ -49,6 +55,11 @@ REPEATED_CHAR_RE = re.compile(r'^(.)\1+$')
 SELLER_TYPE_RE = re.compile(r'^Private Party or Dealer\s*:\s*(Private Party|Dealer)\b')
 # the buyer named at the end of a closing event: "Sold on 9/14/15 for $13,000 to NIACC."
 BUYER_RE = re.compile(r'.*\bto\s+(.+?)[\s.!]*$', re.S)
+
+
+def outer_selectors(selector: str) -> List[str]:
+    """the leading compound selector of each part of a group: '#listing-bid .n, a.b > c' -> ['#listing-bid', 'a.b']"""
+    return [re.split(r'\s*[>+~]\s*|\s+', part.strip(), maxsplit=1)[0] for part in selector.split(',') if part.strip()]
 
 
 def normalize_chassis(raw: str) -> Optional[str]:
@@ -111,6 +122,14 @@ def member_from_comment(comment: dict) -> Optional[Member]:
 def parse_results_page(data: dict) -> List[AuctionSummary]:
     summaries = []
     for item in data.get('items', []):
+        # one malformed item shouldn't cost the rest of the page
+        try:
+            listing_id = int(item['id'])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not item.get('url'):
+            continue
+
         result, amount, currency = parse_result_text(item.get('sold_text', ''))
 
         year = item.get('year')
@@ -119,7 +138,7 @@ def parse_results_page(data: dict) -> List[AuctionSummary]:
             year = int(year_match.group(1)) if year_match else None
 
         summaries.append(AuctionSummary(
-            listing_id=int(item['id']),
+            listing_id=listing_id,
             url=item['url'],
             title=unescape(item.get('title') or ''),
             result=result,
@@ -146,6 +165,32 @@ class ActivityParser:
     def parse_listing(self, html: str, url: str, now: Optional[float] = None) -> AuctionDetail:
         """everything a finished listing page says; raises NotFinal for a live page and LayoutError for one
         missing parts that every finished listing has"""
+        return self._parse(html, url, now)[0]
+
+    def parse_with_fragments(self, html: str, url: str, now: Optional[float] = None) -> Tuple[AuctionDetail, str]:
+        """parse_listing, plus a much smaller document holding only what it read: the embedded comment data and
+        the elements the page-level selectors match. parsing that document should give the same result"""
+        detail, soup, vms = self._parse(html, url, now)
+        return detail, self._fragments(soup, vms)
+
+    def _fragments(self, soup: BeautifulSoup, vms: dict) -> str:
+        wanted = set()
+        for key in PAGE_LEVEL_SELECTORS:
+            for css in outer_selectors(self.selectors[key]):
+                wanted.update(id(elem) for elem in soup.select(css))
+
+        # outermost matches only, in page order, so nothing is duplicated or reordered
+        kept, parts = set(), []
+        for elem in soup.find_all(True):
+            if id(elem) in wanted and not any(id(parent) in kept for parent in elem.parents):
+                kept.add(id(elem))
+                parts.append(str(elem))
+
+        data = json.dumps(vms).replace('</', '<\\/')
+        body = '\n'.join(parts)
+        return f"<html><body>\n{body}\n<script>var {self.selectors['comments_var']} = {data};</script>\n</body></html>\n"
+
+    def _parse(self, html: str, url: str, now: Optional[float]) -> Tuple[AuctionDetail, BeautifulSoup, dict]:
         vms = self._extract_js_object(html, self.selectors['comments_var'])
         if vms is None or 'comments' not in vms:
             raise ListingParseError(f"no embedded comment data at {url}")
@@ -174,7 +219,7 @@ class ActivityParser:
         self._apply_winner(soup, detail, closing_event)
 
         self._check_final(soup, detail, time.time() if now is None else now)
-        return detail
+        return detail, soup, vms
 
     def _check_final(self, soup: BeautifulSoup, detail: AuctionDetail, now: float):
         # a live relist reached through bat history parses fine but has partial bids and no winner
