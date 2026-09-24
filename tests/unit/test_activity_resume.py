@@ -241,6 +241,15 @@ class TestFetchBudget(unittest.TestCase):
         self.assertEqual([u.rsplit('/', 2)[1] for u in client.requests], ['old-a', 'old-b'])
         self.assertEqual(stats['followed'], 2)
 
+    def test_a_sync_counts_a_listing_both_seen_and_due_once(self):
+        self.db.save_detail(ActivityParser(SELECTORS).parse_listing(listing_html(listing_id=5000, history=''), 'u'),
+                            2_000_000_000, 3)
+        with self.db.conn:
+            self.db.conn.execute("UPDATE auctions SET refetch = 1 WHERE listing_id = 5000")
+        stats, client, out = self.fetch(listing_ids=[5000, 5001], due_refetches=True, follow_history=False)
+        self.assertIn('  2 auction(s) waiting for bid history\n', out)
+        self.assertEqual(sorted(u.rsplit('/', 2)[1] for u in client.requests), ['car-0', 'car-1'])
+
     def test_a_bid_count_mismatch_is_recorded_on_the_saved_row(self):
         miscounted = lambda url: listing_html(listing_id=5000, history='').replace(
             'number-bids-value">4<', 'number-bids-value">400<')

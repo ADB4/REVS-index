@@ -187,17 +187,19 @@ class ActivityPipeline:
         upgrade_below = PARSER_VERSION if upgrade else None
         if urls:
             queue = [{'listing_id': None, 'url': url, 'end_ts': None, 'source': 'url'} for url in urls]
-            waiting = len(queue)
+            waiting = None
         else:
             # links left over from earlier runs go first, so a --limit budget finishes the chains it started
             history = self.db.pending_history(max_attempts) if follow_history and listing_ids is None else []
-            rows = list(self.db.pending(limit, since_ts, max_attempts, upgrade_below, listing_ids))
+            # a sync's queue is bounded by what its discovery saw, so it's read whole and counted exactly;
+            # the full backlog is only counted
+            whole = limit is None or due_refetches
+            rows = list(self.db.pending(None if whole else limit, since_ts, max_attempts, upgrade_below, listing_ids))
             if due_refetches:
-                rows += self.db.pending(limit, since_ts, max_attempts, fetched_only=True)
+                rows += self.db.pending(None, since_ts, max_attempts, fetched_only=True)
             queue = [dict(r, source='history') for r in history] + [dict(r, source='queue') for r in rows]
-            waiting = len(history) + self.db.pending_count(since_ts, max_attempts, upgrade_below, listing_ids)
-            if due_refetches:
-                waiting += self.db.pending_count(since_ts, max_attempts, fetched_only=True)
+            waiting = None if whole else len(history) + self.db.pending_count(since_ts, max_attempts, upgrade_below,
+                                                                                listing_ids)
 
         queued = set()
         unique = []
@@ -206,6 +208,8 @@ class ActivityPipeline:
                 queued.add(row['url'])
                 unique.append(row)
         queue = unique
+        if waiting is None:
+            waiting = len(queue)
         budget = f", this run fetches up to {limit}" if limit is not None and limit < waiting else ''
         print(f"  {waiting} auction(s) waiting for bid history{budget}")
 
