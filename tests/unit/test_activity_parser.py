@@ -54,7 +54,7 @@ def comment(cid, kind, name, amount=0, ts=1000, author_id=None, url=None, conten
 
 
 def listing_html(result_text='Sold for <strong>USD $25,500</strong>', comments=None, post_author='137244',
-                 chassis_li=VIN_LI, history=HISTORY, winner_slug=None):
+                 chassis_li=VIN_LI, history=HISTORY, winner_slug=None, listing_id=555):
     if comments is None:
         comments = [
             comment(1, 'comment', 'Just1more', author_id=137244, ts=900),
@@ -71,7 +71,7 @@ def listing_html(result_text='Sold for <strong>USD $25,500</strong>', comments=N
     <html><body>
     <h1 class="post-title">2003 BMW M3 Coupe 6-Speed</h1>
     <span class="show-country-name">USA</span>
-    <span class="listing-available-info"><span data-listing-currently="555"></span>
+    <span class="listing-available-info"><span data-listing-currently="{listing_id}"></span>
       <span class="info-value">{result_text}
         <span class="date date-localize" data-timestamp="1767210841">on 12/31/25</span></span></span>
     <table id="listing-bid">

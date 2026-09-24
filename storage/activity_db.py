@@ -397,6 +397,19 @@ class ActivityDB:
                 WHERE listing_id = ?
             """, (error[:500], listing_id))
 
+    def reset_errors(self) -> dict:
+        """make listings and history links that ran out of attempts eligible again"""
+        with self.conn:
+            listings = self.conn.execute("""
+                UPDATE auctions SET fetch_attempts = 0, fetch_error = NULL
+                WHERE fetched_at IS NULL AND (fetch_attempts > 0 OR fetch_error IS NOT NULL)
+            """).rowcount
+            links = self.conn.execute("""
+                UPDATE listing_links SET follow_attempts = 0, follow_error = NULL
+                WHERE follow_attempts > 0 OR follow_error IS NOT NULL
+            """).rowcount
+        return {'listings': listings, 'links': links}
+
     def mark_url_error(self, url: str, error: str) -> None:
         row = self.conn.execute("SELECT listing_id FROM auctions WHERE url = ?", (url,)).fetchone()
         if row:

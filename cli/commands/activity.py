@@ -7,10 +7,10 @@ import yaml
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 
-from sites.bringatrailer.http_client import BaTClient
+from sites.bringatrailer.http_client import BaTClient, RateLimited, SiteUnavailable, listing_url
 from sites.bringatrailer.activity_parser import ActivityParser
 from storage.activity_db import ActivityDB
-from pipelines.activity_pipeline import ActivityPipeline, fmt_ts
+from pipelines.activity_pipeline import ActivityPipeline, CircuitOpen, fmt_ts
 
 
 ROOT = os.path.join(os.path.dirname(__file__), '../..')
@@ -22,10 +22,19 @@ def parse_date(value: str) -> int:
     return int(datetime.strptime(value, '%Y-%m-%d').replace(tzinfo=timezone.utc).timestamp())
 
 
-def build_pipeline(args, db: ActivityDB) -> ActivityPipeline:
-    with open(CONFIG_PATH) as f:
-        config = yaml.safe_load(f)
+def fmt_utc(ts: float) -> str:
+    try:
+        return datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+    except (OverflowError, OSError, ValueError):
+        return 'a very long time from now'
 
+
+def load_config() -> dict:
+    with open(CONFIG_PATH) as f:
+        return yaml.safe_load(f)
+
+
+def build_pipeline(args, db: ActivityDB, config: dict) -> ActivityPipeline:
     client = BaTClient(
         base_url=config['site']['base_url'],
         disallowed_paths=config['robots_txt']['disallowed_paths'],
@@ -50,7 +59,7 @@ def run_discover(args, pipeline: ActivityPipeline) -> dict:
     return stats
 
 
-def run_fetch(args, pipeline: ActivityPipeline) -> dict:
+def run_fetch(args, pipeline: ActivityPipeline, urls=None) -> dict:
     print("fetching bid histories...")
     print("=" * 70)
     stats = pipeline.fetch(
@@ -59,12 +68,26 @@ def run_fetch(args, pipeline: ActivityPipeline) -> dict:
         max_attempts=args.max_attempts,
         upgrade=args.upgrade,
         follow_history=not args.no_follow_history,
-        urls=getattr(args, 'url', None)
+        urls=urls
     )
     print(f"\n{stats['fetched']} auction(s) saved, {stats['bids']} bids, "
           f"{stats['followed']} history links followed, {stats['failed']} failed")
     print_vehicle_stats(stats['vehicles'])
     return stats
+
+
+def reset_errors(db: ActivityDB):
+    top = db.query("""
+        SELECT substr(fetch_error, 1, 80) AS error, COUNT(*) AS n FROM auctions
+        WHERE fetched_at IS NULL AND fetch_error IS NOT NULL
+        GROUP BY 1 ORDER BY n DESC LIMIT 5
+    """)
+    if top:
+        print("most common errors being cleared:")
+        for row in top:
+            print(f"  {row['n']:>6,}  {row['error']}")
+    counts = db.reset_errors()
+    print(f"{counts['listings']:,} listing(s) and {counts['links']:,} history link(s) will be tried again")
 
 
 def print_vehicle_stats(stats: dict):
@@ -415,7 +438,7 @@ def add_fetch_args(p):
                    help="don't fetch other auctions of the same car linked from a listing's bat history")
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description='track who sells, bids on and wins bringatrailer auctions')
     parser.add_argument('--db', default=DEFAULT_DB, help='sqlite database path')
     sub = parser.add_subparsers(dest='command', required=True)
@@ -436,6 +459,8 @@ def main():
         p.add_argument('--delay', type=float, default=3.0, help='seconds between requests (robots crawl-delay is the floor)')
 
     sub.add_parser('link', help='regroup fetched auctions into vehicles by vin and bat history (no network)')
+    sub.add_parser('reset-errors',
+                   help='clear failure counts so listings and history links that hit --max-attempts are tried again (no network)')
 
     report = sub.add_parser('report', help='summarize selling, bidding and winning activity')
     report.add_argument('--top', type=int, default=15, help='rows per table')
@@ -448,12 +473,25 @@ def main():
     report.add_argument('--min-auctions', type=int,
                         help='minimum shared auctions for --pairs (default 3) or resales for --resales (default 2)')
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    config = load_config()
+
+    urls = None
+    if getattr(args, 'url', None):
+        try:
+            urls = [listing_url(u, config['site']['base_url']) for u in args.url]
+        except ValueError as e:
+            parser.error(f"--url: {e}")
+
     db = ActivityDB(args.db)
 
     try:
         if args.command == 'link':
             print_vehicle_stats(db.rebuild_vehicles())
+            return 0
+
+        if args.command == 'reset-errors':
+            reset_errors(db)
             return 0
 
         if args.command == 'report':
@@ -471,16 +509,31 @@ def main():
             print()
             return 0
 
-        pipeline = build_pipeline(args, db)
+        pipeline = build_pipeline(args, db, config)
+        status = 0
         try:
             if args.command in ('discover', 'sync'):
                 run_discover(args, pipeline)
             if args.command in ('fetch', 'sync'):
-                run_fetch(args, pipeline)
+                stats = run_fetch(args, pipeline, urls)
+                if stats['fetched'] == 0 and stats['failed'] > 0:
+                    status = 1
         except KeyboardInterrupt:
             print("\ninterrupted, progress so far is saved")
+            status = 130
+        except RateLimited as e:
+            print(f"\nstopped: {e}")
+            print(f"resume after {fmt_utc(e.resume_at)}")
+            status = 2
+        except (SiteUnavailable, CircuitOpen) as e:
+            print(f"\nstopped: {e}")
+            if getattr(e, 'site_level', True):
+                print("no listing was charged an attempt for this; once the site answers normally, run the same command again")
+            else:
+                print("check the errors above (a markup change?); after fixing, `reset-errors` makes these listings eligible again")
+            status = 2
         print(f"{pipeline.client.request_count} request(s) made, database at {args.db}")
-        return 0
+        return status
     finally:
         db.close()
 
