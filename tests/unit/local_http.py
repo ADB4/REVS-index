@@ -52,6 +52,8 @@ class LocalServer:
         self.routes = {}
         self.default = (404, {}, b'not found')
         self.hits = []
+        # the request headers, one dict per hit
+        self.headers = []
         self.connections = 0
         server = self
 
@@ -67,6 +69,7 @@ class LocalServer:
 
             def do_GET(self):
                 server.hits.append(self.path)
+                server.headers.append(dict(self.headers))
                 route = server.routes.get(self.path.split('?')[0], server.default)
                 response = route(self) if callable(route) else route
                 if response is None:

@@ -132,7 +132,7 @@ class TestCliReparseAndScopedFetch(CliCase):
         self.server.routes['/listing/car-1/'] = self.server.routes['/listing/car-2/'] = (503, {}, b'')
         status, out = self.run_cli('fetch', '--where', 'listing_id IN (5000, 5001, 5002)', '--max-attempts', '9')
         self.assertIn('3 listing(s) in scope, 3 newly queued', out)
-        self.assertEqual(sorted(set(self.server.paths())), ['/listing/car-0/', '/listing/car-1/', '/listing/car-2/'])
+        self.assertEqual(sorted(set(self.site_paths())), ['/listing/car-0/', '/listing/car-1/', '/listing/car-2/'])
 
         # the rerun picks up only what's left
         self.serve_listings(3)
@@ -140,7 +140,7 @@ class TestCliReparseAndScopedFetch(CliCase):
         status, out = self.run_cli('fetch', '--where', 'listing_id IN (5000, 5001, 5002)', '--max-attempts', '9')
         self.assertEqual(status, 0, out)
         self.assertIn('3 listing(s) in scope, 0 newly queued', out)
-        self.assertEqual(self.server.paths(), ['/listing/car-1/', '/listing/car-2/'])
+        self.assertEqual(self.site_paths(), ['/listing/car-1/', '/listing/car-2/'])
 
         # finished, so the same scope later means a fresh re-fetch of all of it
         self.age_fetches()
@@ -157,7 +157,7 @@ class TestCliReparseAndScopedFetch(CliCase):
             f.write('# listings to look at again\n5002\n\n')
         self.server.hits.clear()
         status, out = self.run_cli('fetch', '--ids-from', path)
-        self.assertEqual((status, self.server.paths()), (0, ['/listing/car-2/']))
+        self.assertEqual((status, self.site_paths()), (0, ['/listing/car-2/']))
 
     def test_bad_where_is_an_argument_error(self):
         with redirect_stdout(io.StringIO()), mock.patch('sys.stderr', io.StringIO()), self.assertRaises(SystemExit):

@@ -17,11 +17,14 @@ import yaml
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 
-from sites.bringatrailer.http_client import BaTClient, RateLimited, SiteUnavailable, listing_url
+from sites.bringatrailer.http_client import (
+    BaTClient, DEFAULT_USER_AGENT, ROBOTS_TOKEN, RateLimited, SiteUnavailable, listing_url
+)
 from sites.bringatrailer.activity_parser import ActivityParser, PARSER_VERSION
 from storage.activity_db import ActivityDB
 from storage.raw_store import RawStore, raw_db_path
 from pipelines.activity_pipeline import ActivityPipeline, CircuitOpen, fmt_ts
+from pipelines.crawl_budget import CrawlBudget, parse_active_hours
 
 
 ROOT = os.path.join(os.path.dirname(__file__), '../..')
@@ -35,6 +38,8 @@ STOP_HINTS = {
                 "again; http and redirect errors do, and `reset-errors` makes those eligible again",
     'unmarked': "nothing was saved or charged for these. compare activity.selectors.ended_marker in "
                 "config/sites/bringatrailer.yaml with a finished listing's page",
+    'robots': "no listing was charged an attempt. if robots.txt couldn't be read, try again later; if it now "
+              "disallows what this crawler needs, read it before changing anything",
 }
 
 
@@ -68,6 +73,27 @@ def positive_int(value: str) -> int:
         raise argparse.ArgumentTypeError(f"{value!r} is not a whole number")
     if number < 1:
         raise argparse.ArgumentTypeError(f"must be 1 or more, got {number}")
+    return number
+
+
+def active_hours_arg(value: str) -> str:
+    try:
+        parse_active_hours(value)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e))
+    return value.strip().lower() if value.strip().lower() in ('off', 'none') else value.strip()
+
+
+def budget_arg(value: str) -> int:
+    """a daily request budget; 0 or 'off' turns it off"""
+    if value.strip().lower() in ('off', 'none'):
+        return 0
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a whole number or 'off'")
+    if number < 0:
+        raise argparse.ArgumentTypeError(f"must be 0 (off) or more, got {number}")
     return number
 
 
@@ -116,14 +142,42 @@ def load_config() -> dict:
         return yaml.safe_load(f)
 
 
+def user_agent(http: dict) -> str:
+    agent = http.get('user_agent') or DEFAULT_USER_AGENT
+    return f"{agent} (+{http['contact']})" if http.get('contact') else agent
+
+
+def build_budget(args, db: ActivityDB) -> CrawlBudget:
+    """--daily-budget and --active-hours are remembered in the database, so later runs keep to them"""
+    if args.daily_budget is not None:
+        db.set_meta('daily_budget', str(args.daily_budget))
+    if args.active_hours is not None:
+        db.set_meta('active_hours', args.active_hours)
+    daily = int(db.get_meta('daily_budget') or 0) or None
+    hours = parse_active_hours(db.get_meta('active_hours') or 'off')
+    return CrawlBudget(db.get_meta, db.set_meta, daily=daily, active_hours=hours)
+
+
 def build_pipeline(args, db: ActivityDB, config: dict, raw_store: RawStore) -> ActivityPipeline:
     client = None
     if hasattr(args, 'delay'):
+        http = config['activity'].get('http') or {}
+        budget = build_budget(args, db)
+        print(f"pacing: {max(args.delay, config['robots_txt']['crawl_delay']):g}s between requests or more, "
+              f"{budget.describe()}")
         client = BaTClient(
             base_url=config['site']['base_url'],
             disallowed_paths=config['robots_txt']['disallowed_paths'],
             crawl_delay=config['robots_txt']['crawl_delay'],
-            delay=args.delay
+            delay=args.delay,
+            user_agent=user_agent(http),
+            robots_token=http.get('robots_token') or ROBOTS_TOKEN,
+            fetch_robots=True,
+            # the run needs the results feed and listing pages; robots.txt ruling either out stops it
+            required_paths=(config['activity']['results_endpoint'], '/listing/example/'),
+            budget=budget,
+            long_pause_every=tuple(http['long_pause_every']) if http.get('long_pause_every') else None,
+            long_pause_seconds=tuple(http['long_pause_seconds']) if http.get('long_pause_seconds') else None
         )
     parser = ActivityParser(config['activity']['selectors'])
     return ActivityPipeline(client, parser, db, config['activity'], raw_store=raw_store)
@@ -628,7 +682,12 @@ def main(argv=None):
         p.add_argument('--since', type=date_arg,
                        help='only auctions ending on or after YYYY-MM-DD (bat history links from them are still followed)')
         p.add_argument('--delay', type=non_negative_float, default=3.0,
-                       help='seconds between requests (robots crawl-delay is the floor)')
+                       help="seconds between requests, plus up to 1.5s jitter (robots.txt's crawl-delay is the floor)")
+        p.add_argument('--daily-budget', type=budget_arg, metavar='N',
+                       help='at most N requests per local day, remembered for later runs; 0 or off to remove')
+        p.add_argument('--active-hours', type=active_hours_arg, metavar='HH:MM-HH:MM',
+                       help='only send requests in this local window, e.g. 08:00-22:00, remembered for later runs; '
+                            'off to remove')
 
     sub.add_parser('link', help='regroup fetched auctions into vehicles by vin and bat history (no network)')
     reparse = sub.add_parser('reparse', help='run the current parser over stored pages again (no network)')

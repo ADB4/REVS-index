@@ -305,11 +305,11 @@ class TestCliConcurrencyAndScope(CliCase):
 
         status, out = self.run_cli('sync')
         self.assertEqual(status, 0, out)
-        self.assertEqual([p for p in self.server.paths() if p.startswith('/listing/')], ['/listing/car-3/'])
+        self.assertEqual([p for p in self.site_paths() if p.startswith('/listing/')], ['/listing/car-3/'])
 
         self.server.hits.clear()
         status, out = self.run_cli('sync', '--all')
-        self.assertEqual(sorted(p for p in self.server.paths() if p.startswith('/listing/')),
+        self.assertEqual(sorted(p for p in self.site_paths() if p.startswith('/listing/')),
                          ['/listing/car-0/', '/listing/car-1/', '/listing/car-2/'])
 
     def test_recheck_mismatches(self):
@@ -325,7 +325,7 @@ class TestCliConcurrencyAndScope(CliCase):
 
         self.server.hits.clear()
         status, out = self.run_cli('fetch', '--recheck-mismatches')
-        self.assertEqual((status, self.server.paths()), (0, ['/listing/car-1/']))
+        self.assertEqual((status, self.site_paths()), (0, ['/listing/car-1/']))
         self.assertIn('1 listing(s) in scope', out)
 
     def test_bad_numbers_and_dates_are_argument_errors(self):

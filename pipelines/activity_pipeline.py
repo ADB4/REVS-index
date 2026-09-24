@@ -3,7 +3,9 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from sites.bringatrailer.http_client import BaTClient, HTTPStatusError, RateLimited, SiteUnavailable, challenge_marker
+from sites.bringatrailer.http_client import (
+    BaTClient, HTTPStatusError, RateLimited, RobotsUnavailable, SiteUnavailable, challenge_marker
+)
 from sites.bringatrailer.activity_parser import (
     ActivityParser, ListingParseError, NotFinal, PARSER_VERSION, parse_results_page
 )
@@ -254,7 +256,8 @@ class ActivityPipeline:
                                                       'source': 'history'})
                             queued.add(link.url)
 
-                except RateLimited:
+                # the server asked us to stop for a while, or robots.txt can't be read or now says no
+                except (RateLimited, RobotsUnavailable):
                     raise
 
                 # a block or outage isn't this listing's fault, so it doesn't use up one of its attempts

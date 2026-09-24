@@ -200,6 +200,14 @@ class CliCase(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
+        # every run reads robots.txt first; serve one like the site's
+        robots = 'User-agent: *\n' + ''.join(f'Disallow: {p}\n' for p in config['robots_txt']['disallowed_paths'])
+        self.server.routes['/robots.txt'] = (200, {'Content-Type': 'text/plain'}, robots.encode())
+
+    def site_paths(self):
+        """requested paths other than robots.txt"""
+        return [p for p in self.server.paths() if p != '/robots.txt']
+
     def tearDown(self):
         self.server.close()
         self.tmp.cleanup()
@@ -235,7 +243,7 @@ class TestCliExitCodes(CliCase):
         self.server.default = (403, {}, b'blocked')
         status, out = self.run_cli('fetch')
         self.assertEqual(status, 2)
-        self.assertEqual(len(self.server.hits), 5)
+        self.assertEqual(len(self.site_paths()), 5)
         self.assertEqual({(r['fetch_attempts'], r['fetch_error']) for r in self.rows()}, {(0, None)})
         self.assertIn('stopped: 5 site-level failures in a row', out)
 
@@ -243,14 +251,14 @@ class TestCliExitCodes(CliCase):
         self.seed(10)
         self.server.default = (200, {'Content-Type': 'text/html'}, CHALLENGE)
         status, out = self.run_cli('fetch')
-        self.assertEqual((status, len(self.server.hits)), (2, 5))
+        self.assertEqual((status, len(self.site_paths())), (2, 5))
         self.assertEqual({r['fetch_attempts'] for r in self.rows()}, {0})
 
     def test_rate_limit_prints_when_to_resume(self):
         self.seed(10)
         self.server.default = (429, {'Retry-After': '3600'}, b'')
         status, out = self.run_cli('fetch')
-        self.assertEqual((status, len(self.server.hits)), (2, 1))
+        self.assertEqual((status, len(self.site_paths())), (2, 1))
         self.assertIn('resume after 2026-', out)
         self.assertIn('UTC', out)
 
@@ -278,8 +286,8 @@ class TestCliExitCodes(CliCase):
         self.server.default = (403, {}, b'blocked')
         status, out = self.run_cli('sync')
         self.assertEqual(status, 2)
-        self.assertEqual(len(self.server.hits), 1)
-        self.assertTrue(self.server.paths()[0].startswith('/wp-json/'))
+        self.assertEqual(len(self.site_paths()), 1)
+        self.assertTrue(self.site_paths()[0].startswith('/wp-json/'))
 
 
 class TestCliRedirects(CliCase):
@@ -296,7 +304,7 @@ class TestCliRedirects(CliCase):
 
         status, out = self.run_cli('fetch')
         self.assertEqual(status, 0, out)
-        self.assertEqual(self.server.paths(), ['/listing/car-0/', '/listing/old-slug/', '/listing/new-slug/'])
+        self.assertEqual(self.site_paths(), ['/listing/car-0/', '/listing/old-slug/', '/listing/new-slug/'])
         db = ActivityDB(self.db_path)
         try:
             self.assertEqual(db.query("SELECT url FROM auctions WHERE listing_id = 7000")[0]['url'], new_url)
@@ -308,7 +316,7 @@ class TestCliRedirects(CliCase):
         # a second run has nothing left to follow
         self.server.hits.clear()
         status, out = self.run_cli('fetch')
-        self.assertEqual((status, self.server.hits), (0, []))
+        self.assertEqual((status, self.site_paths()), (0, []))
 
 
 class TestCliUrlAndReset(CliCase):
@@ -323,7 +331,7 @@ class TestCliUrlAndReset(CliCase):
         self.serve_listings(1)
         status, out = self.run_cli('fetch', '--url', 'car-0')
         self.assertEqual(status, 0, out)
-        self.assertEqual(self.server.paths(), ['/listing/car-0/'])
+        self.assertEqual(self.site_paths(), ['/listing/car-0/'])
 
     def test_reset_errors_requeues_listings_that_ran_out_of_attempts(self):
         self.seed(3)
