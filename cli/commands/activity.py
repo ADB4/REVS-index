@@ -266,8 +266,15 @@ def reset_errors(db: ActivityDB):
 
 
 def print_vehicle_stats(stats: dict):
-    conflicts = f", {stats['vin_conflicts']} linked by bat history despite differing vins" if stats['vin_conflicts'] else ''
-    print(f"{stats['vehicles']:,} vehicles tracked, {stats['repeat_vehicles']:,} auctioned more than once{conflicts}\n")
+    notes = []
+    if stats['vin_conflicts']:
+        notes.append(f"{stats['vin_conflicts']:,} linked by bat history despite differing vins")
+    if stats.get('mixed'):
+        notes.append(f"{stats['mixed']:,} whose listings disagree on the vin, chassis or model")
+    if stats.get('dated'):
+        notes.append(f"{stats['dated']:,} undated auction(s) dated from bat history")
+    extra = ''.join(f", {n}" for n in notes)
+    print(f"{stats['vehicles']:,} vehicles tracked, {stats['repeat_vehicles']:,} auctioned more than once{extra}\n")
 
 
 def money(value) -> str:
@@ -322,8 +329,10 @@ def truncate(n):
 def auction_filters(args, alias: str):
     clauses, params = [], []
     if args.model:
-        clauses.append(f"({alias}.model_slug = ? OR {alias}.model_slug LIKE ?)")
-        params += [args.model, f"{args.model}/%"]
+        # a make takes in its models ("bmw" covers "bmw/e46-m3"); a range, unlike LIKE, can use the index
+        model = args.model.strip().strip('/').lower()
+        clauses.append(f"({alias}.model_slug = ? OR ({alias}.model_slug >= ? AND {alias}.model_slug < ?))")
+        params += [model, f"{model}/", f"{model}0"]
     if args.since:
         clauses.append(f"{alias}.end_ts >= ?")
         params.append(args.since)
@@ -343,13 +352,14 @@ def report_overview(db: ActivityDB, raw_path=None):
             MAX(CASE WHEN fetched_at IS NOT NULL THEN end_ts END) AS last_ts
         FROM auctions
     """)[0]
-    # the stored bids against the auction rows that describe them
+    # the stored bids against the auction rows that describe them (participants sums the bids per listing,
+    # and is rebuilt from them by `link`)
     bid_rows = db.query("""
         SELECT
             SUM(COALESCE(b.n, 0) != COALESCE(a.n_bids, 0)) AS count_differs,
             SUM(a.high_bid > b.top) AS price_above_top_bid
         FROM auctions a
-        LEFT JOIN (SELECT listing_id, COUNT(*) AS n, MAX(amount) AS top FROM bids GROUP BY listing_id) b
+        LEFT JOIN (SELECT listing_id, SUM(n_bids) AS n, MAX(max_bid) AS top FROM participants GROUP BY listing_id) b
             ON b.listing_id = a.listing_id
         WHERE a.fetched_at IS NOT NULL
     """)[0]
@@ -415,41 +425,61 @@ def report_overview(db: ActivityDB, raw_path=None):
 def report_leaderboards(db: ActivityDB, args):
     where, params = auction_filters(args, 'a')
     scope = f" ({args.model or 'all models'}{', since ' + fmt_ts(args.since) if args.since else ''})"
+    # the matching auctions in one pass, so no leaderboard walks an index a row at a time; member names are
+    # looked up only for the rows shown
+    scoped = f"""scoped AS MATERIALIZED (
+        SELECT a.listing_id, a.seller_slug, a.seller_type, a.result, a.currency, a.high_bid, a.winner_slug, a.fetched_at
+        FROM auctions a WHERE 1 = 1{where}
+    )"""
 
     sellers = db.query(f"""
-        SELECT a.seller_slug AS slug, m.display_name, MAX(a.seller_type) AS seller_type,
-               COUNT(*) AS listed, SUM(a.result = 'sold') AS sold,
-               ROUND(1.0 * SUM(a.result = 'sold') / COUNT(*), 3) AS sell_through,
-               SUM(CASE WHEN a.result = 'sold' AND a.currency = 'USD' THEN a.high_bid END) AS sold_usd
-        FROM auctions a LEFT JOIN members m ON m.slug = a.seller_slug
-        WHERE a.fetched_at IS NOT NULL AND a.seller_slug IS NOT NULL{where}
-        GROUP BY a.seller_slug ORDER BY listed DESC, sold_usd DESC LIMIT ?
+        WITH {scoped},
+        top AS (
+            SELECT seller_slug AS slug, MAX(seller_type) AS seller_type, COUNT(*) AS listed, SUM(result = 'sold') AS sold,
+                   ROUND(1.0 * SUM(result = 'sold') / COUNT(*), 3) AS sell_through,
+                   SUM(CASE WHEN result = 'sold' AND currency = 'USD' THEN high_bid END) AS sold_usd
+            FROM scoped WHERE fetched_at IS NOT NULL AND seller_slug IS NOT NULL
+            GROUP BY seller_slug ORDER BY listed DESC, sold_usd DESC, seller_slug LIMIT ?
+        )
+        SELECT top.*, m.display_name FROM top LEFT JOIN members m ON m.slug = top.slug
+        ORDER BY top.listed DESC, top.sold_usd DESC, top.slug
     """, params + [args.top])
     print_table("top sellers" + scope, sellers, [
         ('display_name', 'member', text), ('seller_type', 'type', text), ('listed', 'listed', text),
         ('sold', 'sold', text), ('sell_through', 'sell-thru', pct), ('sold_usd', 'gross sold', money)
     ])
 
-    p_where, p_params = auction_filters(args, 'p')
+    # filtered, the bidders on the matching auctions; unfiltered, the participants table's own index has it
+    if where:
+        counted = f"WITH {scoped} SELECT p.* FROM scoped a CROSS JOIN participants p ON p.listing_id = a.listing_id"
+    else:
+        counted = "SELECT * FROM participants"
     bidders = db.query(f"""
-        SELECT p.slug, m.display_name, COUNT(*) AS auctions_bid, SUM(p.n_bids) AS bids, SUM(p.won) AS won,
-               ROUND(1.0 * SUM(p.won) / COUNT(*), 3) AS win_rate
-        FROM auction_participants p LEFT JOIN members m ON m.slug = p.slug
-        WHERE 1 = 1{p_where}
-        GROUP BY p.slug ORDER BY auctions_bid DESC, bids DESC LIMIT ?
-    """, p_params + [args.top])
+        WITH top AS (
+            SELECT slug, COUNT(*) AS auctions_bid, SUM(n_bids) AS bids, SUM(won) AS won,
+                   ROUND(1.0 * SUM(won) / COUNT(*), 3) AS win_rate
+            FROM ({counted})
+            GROUP BY slug ORDER BY auctions_bid DESC, bids DESC, slug LIMIT ?
+        )
+        SELECT top.*, m.display_name FROM top LEFT JOIN members m ON m.slug = top.slug
+        ORDER BY top.auctions_bid DESC, top.bids DESC, top.slug
+    """, params + [args.top])
     print_table("most active bidders" + scope, bidders, [
         ('display_name', 'member', text), ('auctions_bid', 'auctions', text), ('bids', 'bids', text),
         ('won', 'won', text), ('win_rate', 'win rate', pct)
     ])
 
     winners = db.query(f"""
-        SELECT a.winner_slug AS slug, m.display_name, COUNT(*) AS won,
-               SUM(CASE WHEN a.currency = 'USD' THEN a.high_bid END) AS won_usd,
-               MAX(CASE WHEN a.currency = 'USD' THEN a.high_bid END) AS top_usd
-        FROM auctions a LEFT JOIN members m ON m.slug = a.winner_slug
-        WHERE a.result = 'sold' AND a.winner_slug IS NOT NULL{where}
-        GROUP BY a.winner_slug ORDER BY won DESC, won_usd DESC LIMIT ?
+        WITH {scoped},
+        top AS (
+            SELECT winner_slug AS slug, COUNT(*) AS won,
+                   SUM(CASE WHEN currency = 'USD' THEN high_bid END) AS won_usd,
+                   MAX(CASE WHEN currency = 'USD' THEN high_bid END) AS top_usd
+            FROM scoped WHERE result = 'sold' AND winner_slug IS NOT NULL
+            GROUP BY winner_slug ORDER BY won DESC, won_usd DESC, winner_slug LIMIT ?
+        )
+        SELECT top.*, m.display_name FROM top LEFT JOIN members m ON m.slug = top.slug
+        ORDER BY top.won DESC, top.won_usd DESC, top.slug
     """, params + [args.top])
     print_table("top buyers" + scope, winners, [
         ('display_name', 'member', text), ('won', 'won', text),
@@ -458,66 +488,100 @@ def report_leaderboards(db: ActivityDB, args):
 
 
 def report_pairs(db: ActivityDB, args):
-    rows = db.query("""
-        SELECT s.display_name AS seller, b.display_name AS bidder, p.auctions_bid, p.bids, p.won
-        FROM seller_bidder_pairs p
-        LEFT JOIN members s ON s.slug = p.seller_slug
-        LEFT JOIN members b ON b.slug = p.bidder_slug
-        WHERE p.auctions_bid >= ?
-        ORDER BY p.auctions_bid DESC, p.won DESC LIMIT ?
-    """, (args.min_auctions or 3, args.top))
-    print_table(f"repeat seller/bidder pairs (>= {args.min_auctions or 3} auctions together)", rows, [
+    where, params = auction_filters(args, 'a')
+    min_auctions = args.min_auctions or 3
+    scope = f", {args.model or 'all models'}{', since ' + fmt_ts(args.since) if args.since else ''}" if where else ''
+    if where:
+        pairs = f"""
+            SELECT a.seller_slug, p.slug AS bidder_slug, COUNT(*) AS auctions_bid, SUM(p.won) AS won, SUM(p.n_bids) AS bids
+            FROM auctions a CROSS JOIN participants p ON p.listing_id = a.listing_id
+            WHERE a.seller_slug IS NOT NULL{where}
+            GROUP BY a.seller_slug, p.slug
+        """
+    else:
+        pairs = "SELECT * FROM seller_bidder_pairs"
+    rows = db.query(f"""
+        WITH top AS (
+            SELECT * FROM ({pairs}) WHERE auctions_bid >= ?
+            ORDER BY auctions_bid DESC, won DESC, seller_slug, bidder_slug LIMIT ?
+        )
+        SELECT s.display_name AS seller, b.display_name AS bidder, top.auctions_bid, top.bids, top.won
+        FROM top
+        LEFT JOIN members s ON s.slug = top.seller_slug
+        LEFT JOIN members b ON b.slug = top.bidder_slug
+        ORDER BY top.auctions_bid DESC, top.won DESC, top.seller_slug, top.bidder_slug
+    """, params + [min_auctions, args.top])
+    print_table(f"repeat seller/bidder pairs (>= {min_auctions} auctions together{scope})", rows, [
         ('seller', 'seller', text), ('bidder', 'bidder', text),
         ('auctions_bid', 'auctions', text), ('bids', 'bids', text), ('won', 'won', text)
     ])
 
 
 def report_vehicle(db: ActivityDB, args):
-    vehicle_id = db.find_vehicle_id(args.vehicle)
-    if vehicle_id is None:
+    matches = db.find_vehicles(args.vehicle)
+    if not matches:
         print(f"\nno tracked vehicle matches '{args.vehicle}' (use a vin, chassis number, listing url or listing id)")
         return
+    if len(matches) > 1:
+        print_table(f"'{args.vehicle}' matches {len(matches)} cars; pick one by listing url or listing id", matches, [
+            ('listing_id', 'listing id', text), ('auctions', 'auctions', text), ('title', 'title', truncate(50))
+        ])
+        return
+    vehicle_id = matches[0]['vehicle_id']
 
-    rows = db.query("""
+    rows = [dict(r) for r in db.query("""
         SELECT t.*, s.display_name AS seller, w.display_name AS buyer
         FROM vehicle_timeline t
         LEFT JOIN members s ON s.slug = t.seller_slug
         LEFT JOIN members w ON w.slug = t.winner_slug
         WHERE t.vehicle_id = ? ORDER BY t.seq
+    """, (vehicle_id,))]
+    # auctions of this car bat history knows about that aren't fetched, discovered or not
+    missing = db.query("""
+        SELECT COALESCE(r.url, l.related_url) AS url, MAX(COALESCE(r.end_ts, l.related_end_ts)) AS ended,
+               MAX(l.summary) AS summary, MAX(r.listing_id IS NOT NULL) AS discovered
+        FROM listing_links l
+        JOIN auctions a ON a.listing_id = l.listing_id
+        LEFT JOIN auctions r ON r.listing_id = l.related_listing_id
+        WHERE a.vehicle_id = ? AND (l.related_listing_id IS NULL OR r.fetched_at IS NULL)
+        GROUP BY COALESCE(CAST(l.related_listing_id AS TEXT), l.related_url)
+        ORDER BY ended IS NULL, ended
     """, (vehicle_id,))
+
+    # a label that compares across a missing auction may change once it's fetched
+    gaps = [m['ended'] for m in missing if m['ended']]
+    for row in rows:
+        after = row['prev_end_ts'] if row['seq'] > 1 else float('-inf')
+        before = row['end_ts'] if row['end_ts'] is not None else float('inf')
+        if any((after or float('-inf')) < ts <= before for ts in gaps):
+            row['transition'] += ' (provisional)'
     chassis = sorted({r['vin'] or r['chassis'] for r in rows if r['vin'] or r['chassis']})
 
     print("=" * 70)
     print(rows[-1]['title'])
-    print(f"  chassis: {', '.join(chassis) or '?'}  |  {len(rows)} auction(s) on bat")
+    print(f"  chassis: {', '.join(chassis) or '?'}  |  {len(rows)} of {len(rows) + len(missing)} known auction(s) fetched")
     print("=" * 70)
     print_table("auction history", rows, [
         ('end_ts', 'ended', fmt_ts), ('result', 'result', label), ('high_bid', 'price', money),
         ('seller', 'seller', text), ('buyer', 'buyer', text), ('transition', 'what happened', label),
         ('days_since_prev', 'days since prev', days), ('change_since_prev', 'price change', signed_money)
     ])
-
-    unfetched = db.query("""
-        SELECT l.related_url, MAX(l.related_end_ts) AS end_ts, MAX(l.summary) AS summary
-        FROM listing_links l JOIN auctions a ON a.listing_id = l.listing_id
-        WHERE a.vehicle_id = ? AND l.related_listing_id IS NULL
-        GROUP BY l.related_url ORDER BY end_ts
-    """, (vehicle_id,))
-    if unfetched:
-        print_table("bat history entries not fetched yet", unfetched, [
-            ('end_ts', 'ended', fmt_ts), ('summary', 'summary', text), ('related_url', 'url', text)
+    if missing:
+        print_table("auctions of this car not fetched yet", missing, [
+            ('ended', 'ended', fmt_ts), ('discovered', 'discovered', lambda v: 'yes' if v else 'no'),
+            ('summary', 'summary', text), ('url', 'url', text)
         ])
+        undated = len(missing) - len(gaps)
+        if undated:
+            print(f"  {undated} of them without a date, so any label here may change")
 
 
 def report_resales(db: ActivityDB, args):
-    clauses, params = [], []
-    if args.model:
-        clauses.append("(a.model_slug = ? OR a.model_slug LIKE ?)")
-        params += [args.model, f"{args.model}/%"]
+    # --since here means resold since, so only the model half of the usual filters applies to the auction
+    where, params = auction_filters(argparse.Namespace(model=args.model, since=None), 'a')
     if args.since:
-        clauses.append("r.sold_ts >= ?")
+        where += " AND r.sold_ts >= ?"
         params.append(args.since)
-    where = ''.join(f" AND {c}" for c in clauses)
     min_resales = args.min_auctions or 2
     scope = f" ({args.model or 'all models'}{', resold since ' + fmt_ts(args.since) if args.since else ''})"
 
@@ -555,20 +619,43 @@ def report_resales(db: ActivityDB, args):
 
 
 def report_member(db: ActivityDB, args):
+    """one member's profile, read from the base tables by slug so it's quick however large the database"""
     slug = args.member.lower()
-    summary = db.query("SELECT * FROM member_activity WHERE slug = ?", (slug,))
-    if not summary:
+    member = db.query("SELECT slug, display_name, user_id FROM members WHERE slug = ?", (slug,))
+    if not member:
         print(f"\nno member '{slug}' in the database")
         return
-    s = summary[0]
+    m = member[0]
+
+    selling = db.query("""
+        SELECT COUNT(*) AS listed, COALESCE(SUM(result = 'sold'), 0) AS sold,
+               COALESCE(SUM(CASE WHEN result = 'sold' AND currency = 'USD' THEN high_bid END), 0) AS sold_usd,
+               MIN(end_ts) AS first_ts, MAX(end_ts) AS last_ts
+        FROM auctions WHERE seller_slug = ? AND fetched_at IS NOT NULL
+    """, (slug,))[0]
+    bidding = db.query("""
+        SELECT COUNT(*) AS auctions_bid, COALESCE(SUM(n_bids), 0) AS bids, COALESCE(SUM(won), 0) AS won_bid_on,
+               MIN(first_bid_ts) AS first_ts, MAX(last_bid_ts) AS last_ts
+        FROM participants WHERE slug = ?
+    """, (slug,))[0]
+    winning = db.query("""
+        SELECT COUNT(*) AS won, COALESCE(SUM(CASE WHEN a.currency = 'USD' THEN a.high_bid END), 0) AS won_usd,
+               COALESCE(SUM(p.listing_id IS NULL), 0) AS without_bid
+        FROM auctions a LEFT JOIN participants p ON p.listing_id = a.listing_id AND p.slug = a.winner_slug
+        WHERE a.winner_slug = ? AND a.result = 'sold'
+    """, (slug,))[0]
+    # the share of the auctions they bid on that they won
+    win_rate = bidding['won_bid_on'] / bidding['auctions_bid'] if bidding['auctions_bid'] else None
+    seen = [t for t in (selling['first_ts'], bidding['first_ts'], selling['last_ts'], bidding['last_ts']) if t]
+    no_bid = f"; {winning['without_bid']} of them without a bid of theirs" if winning['without_bid'] else ''
 
     print("=" * 70)
-    print(f"{s['display_name'] or slug}  (member/{slug}/, id {text(s['user_id'])})")
+    print(f"{m['display_name'] or slug}  (member/{slug}/, id {text(m['user_id'])})")
     print("=" * 70)
-    print(f"  active       : {fmt_ts(s['first_seen_ts'])} to {fmt_ts(s['last_seen_ts'])}")
-    print(f"  selling      : {s['listed']} listed, {s['sold']} sold, {money(s['sold_usd'])} gross")
-    print(f"  bidding      : {s['bids']} bids across {s['auctions_bid']} auctions")
-    print(f"  winning      : {s['won']} won ({pct(s['win_rate'])} of auctions bid), {money(s['won_usd'])} spent")
+    print(f"  active       : {fmt_ts(min(seen) if seen else None)} to {fmt_ts(max(seen) if seen else None)}")
+    print(f"  selling      : {selling['listed']} listed, {selling['sold']} sold, {money(selling['sold_usd'])} gross")
+    print(f"  bidding      : {bidding['bids']} bids across {bidding['auctions_bid']} auctions")
+    print(f"  winning      : {winning['won']} won ({pct(win_rate)} of auctions bid), {money(winning['won_usd'])} spent{no_bid}")
 
     listings = db.query("""
         SELECT a.end_ts, a.result, a.high_bid, a.title, w.display_name AS winner
@@ -581,11 +668,11 @@ def report_member(db: ActivityDB, args):
     ])
 
     bid_on = db.query("""
-        SELECT p.end_ts, p.max_bid, p.high_bid, p.won, a.title, s.display_name AS seller
-        FROM auction_participants p
+        SELECT a.end_ts, p.max_bid, a.high_bid, p.won, a.title, s.display_name AS seller
+        FROM participants p
         JOIN auctions a ON a.listing_id = p.listing_id
-        LEFT JOIN members s ON s.slug = p.seller_slug
-        WHERE p.slug = ? ORDER BY p.end_ts DESC LIMIT ?
+        LEFT JOIN members s ON s.slug = a.seller_slug
+        WHERE p.slug = ? ORDER BY a.end_ts DESC LIMIT ?
     """, (slug, args.top))
     print_table("bid on", bid_on, [
         ('end_ts', 'ended', fmt_ts), ('max_bid', 'their max', money), ('high_bid', 'final', money),
@@ -593,34 +680,34 @@ def report_member(db: ActivityDB, args):
     ])
 
     makes = db.query("""
-        SELECT COALESCE(make, '?') AS make, COUNT(*) AS auctions_bid, SUM(won) AS won
-        FROM auction_participants WHERE slug = ?
-        GROUP BY make ORDER BY auctions_bid DESC LIMIT ?
+        SELECT COALESCE(a.make, '?') AS make, COUNT(*) AS auctions_bid, SUM(p.won) AS won
+        FROM participants p JOIN auctions a ON a.listing_id = p.listing_id
+        WHERE p.slug = ?
+        GROUP BY a.make ORDER BY auctions_bid DESC LIMIT ?
     """, (slug, args.top))
     print_table("makes bid on", makes, [('make', 'make', text), ('auctions_bid', 'auctions', text), ('won', 'won', text)])
 
     buys_from = db.query("""
-        SELECT m.display_name AS seller, p.auctions_bid, p.won FROM seller_bidder_pairs p
-        LEFT JOIN members m ON m.slug = p.seller_slug
-        WHERE p.bidder_slug = ? ORDER BY p.auctions_bid DESC, p.won DESC LIMIT ?
+        SELECT m.display_name AS seller, COUNT(*) AS auctions_bid, SUM(p.won) AS won
+        FROM participants p LEFT JOIN members m ON m.slug = p.seller_slug
+        WHERE p.slug = ? AND p.seller_slug IS NOT NULL
+        GROUP BY p.seller_slug ORDER BY auctions_bid DESC, won DESC LIMIT ?
     """, (slug, args.top))
     print_table("sellers they bid on most", buys_from, [
         ('seller', 'seller', text), ('auctions_bid', 'auctions', text), ('won', 'won', text)
     ])
 
     bidders = db.query("""
-        SELECT m.display_name AS bidder, p.auctions_bid, p.won FROM seller_bidder_pairs p
-        LEFT JOIN members m ON m.slug = p.bidder_slug
-        WHERE p.seller_slug = ? ORDER BY p.auctions_bid DESC, p.won DESC LIMIT ?
+        SELECT m.display_name AS bidder, COUNT(*) AS auctions_bid, SUM(p.won) AS won
+        FROM participants p LEFT JOIN members m ON m.slug = p.slug
+        WHERE p.seller_slug = ?
+        GROUP BY p.slug ORDER BY auctions_bid DESC, won DESC LIMIT ?
     """, (slug, args.top))
     print_table("who bids on their cars", bidders, [
         ('bidder', 'bidder', text), ('auctions_bid', 'auctions', text), ('won', 'won', text)
     ])
 
-    resales = db.query("""
-        SELECT * FROM member_resales WHERE slug = ? ORDER BY sold_ts DESC LIMIT ?
-    """, (slug, args.top))
-    print_table("cars they won and later resold on bat", resales, [
+    print_table("cars they won and later resold on bat", db.resales_of(slug, args.top), [
         ('title', 'title', truncate(36)), ('bought_ts', 'bought', fmt_ts), ('bought_price', 'paid', money),
         ('sold_ts', 'resold', fmt_ts), ('sold_price', 'resold for', money),
         ('days_held', 'days', days), ('pct_change', 'change', signed_pct)
@@ -689,7 +776,7 @@ def main(argv=None):
                        help='only send requests in this local window, e.g. 08:00-22:00, remembered for later runs; '
                             'off to remove')
 
-    sub.add_parser('link', help='regroup fetched auctions into vehicles by vin and bat history (no network)')
+    sub.add_parser('link', help='rebuild the participants table and regroup auctions into vehicles (no network)')
     reparse = sub.add_parser('reparse', help='run the current parser over stored pages again (no network)')
     add_scope_args(reparse, 'reparse')
     sub.add_parser('reset-errors',
@@ -697,16 +784,24 @@ def main(argv=None):
 
     report = sub.add_parser('report', help='summarize selling, bidding and winning activity')
     report.add_argument('--top', type=positive_int, default=15, help='rows per table')
-    report.add_argument('--model', help='make or model slug, e.g. bmw or bmw/e46-m3')
-    report.add_argument('--since', type=date_arg, help='only auctions ending on or after YYYY-MM-DD')
-    report.add_argument('--member', help='member slug for a single-member profile')
-    report.add_argument('--vehicle', help='vin, chassis number, listing url or listing id: every bat auction of that car')
-    report.add_argument('--resales', action='store_true', help='members who resell cars they won, with hold time and price change')
-    report.add_argument('--pairs', action='store_true', help='show repeat seller/bidder relationships')
+    report.add_argument('--model', help='make or model slug, e.g. bmw or bmw/e46-m3 (leaderboards, --pairs, --resales)')
+    report.add_argument('--since', type=date_arg,
+                        help='only auctions ending on or after YYYY-MM-DD (leaderboards, --pairs, --resales)')
+    mode = report.add_mutually_exclusive_group()
+    mode.add_argument('--member', help='member slug for a single-member profile')
+    mode.add_argument('--vehicle', help='vin, chassis number, listing url or listing id: every bat auction of that car')
+    mode.add_argument('--resales', action='store_true', help='members who resell cars they won, with hold time and price change')
+    mode.add_argument('--pairs', action='store_true', help='show repeat seller/bidder relationships')
     report.add_argument('--min-auctions', type=positive_int,
                         help='minimum shared auctions for --pairs (default 3) or resales for --resales (default 2)')
 
     args = parser.parse_args(argv)
+    if args.command == 'report':
+        # say so rather than quietly ignore a filter
+        if (args.member or args.vehicle) and (args.model or args.since):
+            parser.error("--model and --since don't apply to --member or --vehicle")
+        if args.min_auctions and not (args.pairs or args.resales):
+            parser.error("--min-auctions only applies to --pairs and --resales")
     config = load_config()
 
     urls = None
@@ -733,6 +828,7 @@ def run_command(args, parser: argparse.ArgumentParser, config: dict, urls) -> in
 
     try:
         if args.command == 'link':
+            print(f"{db.rebuild_participants():,} bidder/auction rows rebuilt from the bids")
             print_vehicle_stats(db.rebuild_vehicles())
             return 0
 
@@ -750,7 +846,9 @@ def run_command(args, parser: argparse.ArgumentParser, config: dict, urls) -> in
             elif args.pairs:
                 report_pairs(db, args)
             else:
-                report_overview(db, raw_path)
+                # the overview describes the whole database, so a filtered report leaves it out
+                if not (args.model or args.since):
+                    report_overview(db, raw_path)
                 report_leaderboards(db, args)
             print()
             return 0

@@ -218,6 +218,30 @@ class TestActivityDB(unittest.TestCase):
         # already re-fetched since the scope was queued: not queued again
         self.assertEqual(self.db.mark_stale([1, 2], fetched_before=SAVED - 1), 0)
 
+    def test_participants_follow_each_save(self):
+        self.db.upsert_summaries([summary(1)], now=1)
+        self.db.save_detail(detail(1, 'dealer', [('alice', 1000), ('bob', 2000), ('alice', 3000)]), now=SAVED, parser_version=PV)
+        rows = {r['slug']: r for r in self.db.query("SELECT * FROM participants")}
+        self.assertEqual((rows['alice']['n_bids'], rows['alice']['max_bid'], rows['alice']['won']), (2, 3000, 1))
+        self.assertEqual((rows['bob']['won'], rows['bob']['seller_slug']), (0, 'dealer'))
+
+        self.db.save_detail(detail(1, 'dealer', [('bob', 2000)]), now=SAVED + 1, parser_version=PV)
+        self.assertEqual([(r['slug'], r['won']) for r in self.db.query("SELECT * FROM participants")], [('bob', 1)])
+        self.assertEqual(self.db.rebuild_participants(), 1)
+
+    def test_win_rate_comes_from_the_auctions_bid_on(self):
+        self.db.upsert_summaries([summary(i) for i in (1, 2)], now=1)
+        self.db.save_detail(detail(1, 'dealer', [('alice', 1000)]), now=SAVED, parser_version=PV)
+        # bob won auction 2 without a parsed bid of his own
+        self.db.save_detail(detail(2, 'dealer', [('alice', 500)], winner=None), now=SAVED, parser_version=PV)
+        with self.db.conn:
+            self.db.conn.execute("INSERT INTO members (slug) VALUES ('bob')")
+            self.db.conn.execute("UPDATE auctions SET winner_slug = 'bob' WHERE listing_id = 2")
+        self.db.rebuild_participants()
+        rows = {r['slug']: r for r in self.db.query("SELECT * FROM member_activity")}
+        self.assertEqual((rows['bob']['won'], rows['bob']['won_without_bid'], rows['bob']['win_rate']), (1, 1, None))
+        self.assertEqual((rows['alice']['won'], rows['alice']['auctions_bid'], rows['alice']['win_rate']), (1, 2, 0.5))
+
     def test_meta_roundtrip(self):
         self.assertIsNone(self.db.get_meta('backfill_next_page'))
         self.db.set_meta('backfill_next_page', '12')
@@ -355,6 +379,88 @@ class TestVehicleTracking(unittest.TestCase):
         self.assertEqual(self.db.find_vehicle_id('5'), 1)
 
 
+class TestTimelineLabels(unittest.TestCase):
+
+    VIN = 'WBSBR934X2EX23144'
+
+    def setUp(self):
+        self.db = ActivityDB(':memory:')
+
+    def tearDown(self):
+        self.db.close()
+
+    def timeline(self):
+        self.db.rebuild_vehicles()
+        return [(r['listing_id'], r['transition']) for r in self.db.query("SELECT * FROM vehicle_timeline ORDER BY seq")]
+
+    def save(self, *details):
+        for d in details:
+            self.db.save_detail(d, now=SAVED, parser_version=PV)
+
+    def test_unknown_seller_and_unknown_previous(self):
+        first = detail(1, 'a', [('b', 100)], vin=self.VIN, end_ts=1000)
+        nameless = detail(2, 'b', [('c', 200)], vin=self.VIN, end_ts=2000)
+        nameless.seller = None
+        after = detail(3, 'b', [('d', 300)], vin=self.VIN, end_ts=3000)
+        self.save(first, nameless, after)
+        with self.db.conn:
+            self.db.conn.execute("UPDATE auctions SET seller_slug = NULL WHERE listing_id = 2")
+        self.assertEqual(self.timeline(), [(1, 'first_seen'), (2, 'unknown_seller'), (3, 'unknown_prev')])
+
+    def test_relisted_unsold_only_after_reserve_not_met_or_withdrawn(self):
+        self.save(
+            detail(1, 'a', [('b', 100)], vin=self.VIN, end_ts=1000, result='reserve_not_met'),
+            detail(2, 'a', [('b', 100)], vin=self.VIN, end_ts=2000, result='withdrawn'),
+            detail(3, 'a', [('b', 100)], vin=self.VIN, end_ts=3000),
+        )
+        with self.db.conn:
+            self.db.conn.execute("UPDATE auctions SET result = NULL WHERE listing_id = 3")
+        self.save(detail(4, 'a', [('c', 100)], vin=self.VIN, end_ts=4000))
+        self.assertEqual(self.timeline(), [(1, 'first_seen'), (2, 'relisted_unsold'), (3, 'relisted_unsold'),
+                                           (4, 'unknown_prev')])
+
+    def test_undated_auctions_go_last_or_borrow_a_date_from_bat_history(self):
+        undated = detail(1, 'a', [('b', 100)], vin=self.VIN)
+        undated.end_ts = None
+        self.save(undated, detail(2, 'b', [('c', 200)], vin=self.VIN, end_ts=5000))
+        self.assertEqual(self.timeline(), [(2, 'first_seen'), (1, 'new_seller')])
+
+        # a later listing's bat history dates it
+        linker = detail(3, 'c', [('d', 300)], vin=self.VIN, end_ts=9000)
+        linker.history = [HistoryLink(url=url(1), end_ts=1500)]
+        self.save(linker)
+        self.assertEqual(self.timeline(), [(1, 'first_seen'), (2, 'resold_by_buyer'), (3, 'resold_by_buyer')])
+        self.assertEqual(self.db.query("SELECT end_ts FROM auctions WHERE listing_id = 1")[0]['end_ts'], 1500)
+
+
+class TestFindVehicle(unittest.TestCase):
+
+    def setUp(self):
+        self.db = ActivityDB(':memory:')
+        for d in (detail(168413, 'a', [('b', 1)], vin='WBSBR934X2EX23144'),
+                  detail(2, 'c', [('d', 1)], make='Porsche', chassis='168413'),
+                  detail(3, 'e', [('f', 1)], make='Porsche', chassis='9113101234'),
+                  detail(4, 'g', [('h', 1)], make='Jaguar', chassis='9113101234')):
+            self.db.save_detail(d, now=SAVED, parser_version=PV)
+        self.db.rebuild_vehicles()
+
+    def tearDown(self):
+        self.db.close()
+
+    def test_a_listing_id_beats_a_chassis_with_the_same_digits(self):
+        self.assertEqual(self.db.find_vehicle_id('168413'), 168413)
+
+    def test_vins_and_urls_are_normalized(self):
+        self.assertEqual(self.db.find_vehicle_id('wbs-br934x2ex23144 '), 168413)
+        self.assertEqual(self.db.find_vehicle_id('http://bringatrailer.com/listing/car-168413?utm=x'), 168413)
+        self.assertEqual(self.db.find_vehicle_id('https://bringatrailer.com/listing/car-2'), 2)
+
+    def test_an_ambiguous_chassis_lists_the_candidates(self):
+        self.assertIsNone(self.db.find_vehicle_id('911 310 1234'))
+        self.assertEqual([r['vehicle_id'] for r in self.db.find_vehicles('911 310 1234')], [3, 4])
+        self.assertEqual(self.db.find_vehicles('nothing-like-this'), [])
+
+
 class TestMigration(unittest.TestCase):
 
     def test_opens_database_created_before_vin_tracking(self):
@@ -416,8 +522,11 @@ class TestMigration(unittest.TestCase):
 
             db = ActivityDB(path)
             self.assertFalse(db._url_is_unique())
-            self.assertEqual(db.get_meta('schema_version'), '2')
+            self.assertEqual(db.get_meta('schema_version'), '3')
             self.assertEqual(db.query("SELECT COUNT(*) AS n FROM auctions")[0]['n'], 2)
+            # the participants table is filled from the bids already there
+            self.assertEqual([(r['slug'], r['n_bids']) for r in db.query("SELECT * FROM participants ORDER BY slug")],
+                             [('b', 1), ('c', 1)])
             self.assertEqual(db.query("SELECT COUNT(*) AS n FROM bids")[0]['n'], 2)
             self.assertEqual(db.query("PRAGMA foreign_key_check"), [])
             self.assertEqual(db.query("SELECT related_listing_id FROM listing_links")[0]['related_listing_id'], 2)

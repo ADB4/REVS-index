@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import time
 import sqlite3
@@ -82,6 +83,20 @@ CREATE TABLE IF NOT EXISTS bids (
     ts INTEGER NOT NULL
 );
 
+-- one row per member per auction they bid on, kept in step with bids by save_detail (and rebuilt by link),
+-- so reports don't aggregate every bid each time
+CREATE TABLE IF NOT EXISTS participants (
+    listing_id INTEGER NOT NULL REFERENCES auctions(listing_id),
+    slug TEXT NOT NULL,
+    seller_slug TEXT,
+    n_bids INTEGER NOT NULL,
+    max_bid INTEGER,
+    first_bid_ts INTEGER,
+    last_bid_ts INTEGER,
+    won INTEGER NOT NULL,
+    PRIMARY KEY (listing_id, slug)
+) WITHOUT ROWID;
+
 -- "bat history" links from a listing to other auctions of the same vehicle
 CREATE TABLE IF NOT EXISTS listing_links (
     listing_id INTEGER NOT NULL REFERENCES auctions(listing_id),
@@ -111,8 +126,18 @@ ADDED_COLUMNS = [
     ('auctions', 'refetch', 'INTEGER NOT NULL DEFAULT 0'),
 ]
 
-# 2: auctions.url no longer UNIQUE
-SCHEMA_VERSION = 2
+# 2: auctions.url no longer UNIQUE; 3: participants table
+SCHEMA_VERSION = 3
+
+# fills participants for the listings a WHERE clause on bids picks
+PARTICIPANTS_INSERT = """
+    INSERT INTO participants (listing_id, slug, seller_slug, n_bids, max_bid, first_bid_ts, last_bid_ts, won)
+    SELECT b.listing_id, b.bidder_slug, a.seller_slug, COUNT(*), MAX(b.amount), MIN(b.ts), MAX(b.ts),
+           COALESCE(a.winner_slug = b.bidder_slug, 0)
+    FROM bids b JOIN auctions a ON a.listing_id = b.listing_id
+    {where}
+    GROUP BY b.listing_id, b.bidder_slug
+"""
 
 # a reserve-not-met auction can still sell in a post-auction deal; look once more after this long
 REFETCH_GRACE = 10 * 86400
@@ -130,134 +155,15 @@ CREATE INDEX IF NOT EXISTS idx_auctions_vehicle ON auctions(vehicle_id);
 CREATE INDEX IF NOT EXISTS idx_auctions_url ON auctions(url);
 CREATE INDEX IF NOT EXISTS idx_bids_bidder ON bids(bidder_slug);
 CREATE INDEX IF NOT EXISTS idx_bids_listing ON bids(listing_id);
+CREATE INDEX IF NOT EXISTS idx_participants_slug ON participants(slug, n_bids, won);
+CREATE INDEX IF NOT EXISTS idx_participants_seller ON participants(seller_slug, slug, n_bids, won);
 CREATE INDEX IF NOT EXISTS idx_links_related_url ON listing_links(related_url);
 CREATE INDEX IF NOT EXISTS idx_links_related_id ON listing_links(related_listing_id);
 """
 
-# views are dropped and recreated on open so they always match this file
-VIEWS = {
-    # one row per member per auction they bid on
-    'auction_participants': """
-        SELECT
-            b.listing_id,
-            b.bidder_slug AS slug,
-            COUNT(*) AS n_bids,
-            MAX(b.amount) AS max_bid,
-            MIN(b.ts) AS first_bid_ts,
-            MAX(b.ts) AS last_bid_ts,
-            COALESCE(a.winner_slug = b.bidder_slug, 0) AS won,
-            a.seller_slug,
-            a.make,
-            a.model,
-            a.model_slug,
-            a.result,
-            a.high_bid,
-            a.currency,
-            a.end_ts
-        FROM bids b
-        JOIN auctions a ON a.listing_id = b.listing_id
-        GROUP BY b.listing_id, b.bidder_slug
-    """,
-
-    # selling, bidding and winning totals per member (money columns are USD-only)
-    'member_activity': """
-        WITH selling AS (
-            SELECT
-                seller_slug AS slug,
-                COUNT(*) AS listed,
-                SUM(result = 'sold') AS sold,
-                SUM(CASE WHEN result = 'sold' AND currency = 'USD' THEN high_bid END) AS sold_usd,
-                MIN(end_ts) AS first_listed_ts,
-                MAX(end_ts) AS last_listed_ts
-            FROM auctions
-            WHERE fetched_at IS NOT NULL AND seller_slug IS NOT NULL
-            GROUP BY seller_slug
-        ),
-        bidding AS (
-            SELECT
-                bidder_slug AS slug,
-                COUNT(*) AS bids,
-                COUNT(DISTINCT listing_id) AS auctions_bid,
-                MIN(ts) AS first_bid_ts,
-                MAX(ts) AS last_bid_ts
-            FROM bids
-            GROUP BY bidder_slug
-        ),
-        winning AS (
-            SELECT
-                winner_slug AS slug,
-                COUNT(*) AS won,
-                SUM(CASE WHEN currency = 'USD' THEN high_bid END) AS won_usd
-            FROM auctions
-            WHERE result = 'sold' AND winner_slug IS NOT NULL
-            GROUP BY winner_slug
-        )
-        SELECT
-            m.slug,
-            m.display_name,
-            m.user_id,
-            COALESCE(s.listed, 0) AS listed,
-            COALESCE(s.sold, 0) AS sold,
-            COALESCE(s.sold_usd, 0) AS sold_usd,
-            COALESCE(b.auctions_bid, 0) AS auctions_bid,
-            COALESCE(b.bids, 0) AS bids,
-            COALESCE(w.won, 0) AS won,
-            COALESCE(w.won_usd, 0) AS won_usd,
-            ROUND(1.0 * COALESCE(w.won, 0) / NULLIF(b.auctions_bid, 0), 3) AS win_rate,
-            MIN(COALESCE(s.first_listed_ts, b.first_bid_ts), COALESCE(b.first_bid_ts, s.first_listed_ts)) AS first_seen_ts,
-            MAX(COALESCE(s.last_listed_ts, b.last_bid_ts), COALESCE(b.last_bid_ts, s.last_listed_ts)) AS last_seen_ts
-        FROM members m
-        LEFT JOIN selling s ON s.slug = m.slug
-        LEFT JOIN bidding b ON b.slug = m.slug
-        LEFT JOIN winning w ON w.slug = m.slug
-    """,
-
-    # how often each bidder shows up on a given seller's auctions
-    'seller_bidder_pairs': """
-        SELECT
-            seller_slug,
-            slug AS bidder_slug,
-            COUNT(*) AS auctions_bid,
-            SUM(won) AS won,
-            SUM(n_bids) AS bids
-        FROM auction_participants
-        WHERE seller_slug IS NOT NULL
-        GROUP BY seller_slug, slug
-    """,
-
-    # every auction of every tracked vehicle, in order, with what changed since the previous one
-    'vehicle_timeline': """
-        SELECT
-            t.*,
-            CASE
-                WHEN t.seq = 1 THEN 'first_seen'
-                WHEN t.prev_result = 'sold' AND t.seller_slug = t.prev_winner_slug THEN 'resold_by_buyer'
-                WHEN t.prev_result = 'sold' AND t.seller_slug = t.prev_seller_slug THEN 'relisted_after_sale'
-                WHEN t.seller_slug = t.prev_seller_slug THEN 'relisted_unsold'
-                ELSE 'new_seller'
-            END AS transition,
-            ROUND((t.end_ts - t.prev_end_ts) / 86400.0, 1) AS days_since_prev,
-            CASE WHEN t.currency = t.prev_currency THEN t.high_bid - t.prev_high_bid END AS change_since_prev
-        FROM (
-            SELECT
-                a.vehicle_id, a.listing_id, a.url, a.title, a.vin, a.chassis, a.make, a.model_slug,
-                a.end_ts, a.result, a.high_bid, a.currency, a.seller_slug, a.winner_slug,
-                ROW_NUMBER() OVER w AS seq,
-                COUNT(*) OVER (PARTITION BY a.vehicle_id) AS n_auctions,
-                LAG(a.end_ts) OVER w AS prev_end_ts,
-                LAG(a.result) OVER w AS prev_result,
-                LAG(a.high_bid) OVER w AS prev_high_bid,
-                LAG(a.currency) OVER w AS prev_currency,
-                LAG(a.seller_slug) OVER w AS prev_seller_slug,
-                LAG(a.winner_slug) OVER w AS prev_winner_slug
-            FROM auctions a
-            WHERE a.vehicle_id IS NOT NULL AND a.fetched_at IS NOT NULL
-            WINDOW w AS (PARTITION BY a.vehicle_id ORDER BY a.end_ts, a.listing_id)
-        ) t
-    """,
-
-    # cars a member won and later sold again on bat themselves (gross prices, before fees)
-    'member_resales': """
+# cars a member won and later sold again on bat themselves. scope narrows the auctions looked at, a whole
+# vehicle at a time, so each car's order still holds
+MEMBER_RESALES = """
         SELECT
             s.winner_slug AS slug,
             s.vehicle_id,
@@ -283,11 +189,143 @@ VIEWS = {
                 LEAD(a.currency) OVER w AS next_currency,
                 LEAD(a.seller_slug) OVER w AS next_seller_slug
             FROM auctions a
-            WHERE a.vehicle_id IS NOT NULL AND a.result = 'sold' AND a.fetched_at IS NOT NULL
-            WINDOW w AS (PARTITION BY a.vehicle_id ORDER BY a.end_ts, a.listing_id)
+            WHERE a.vehicle_id IS NOT NULL AND a.result = 'sold' AND a.fetched_at IS NOT NULL{scope}
+            WINDOW w AS (PARTITION BY a.vehicle_id ORDER BY a.end_ts IS NULL, a.end_ts, a.listing_id)
         ) s
         WHERE s.next_seller_slug = s.winner_slug
+"""
+
+# views are dropped and recreated on open so they always match this file
+VIEWS = {
+    # one row per member per auction they bid on
+    'auction_participants': """
+        SELECT
+            p.listing_id,
+            p.slug,
+            p.n_bids,
+            p.max_bid,
+            p.first_bid_ts,
+            p.last_bid_ts,
+            p.won,
+            a.seller_slug,
+            a.make,
+            a.model,
+            a.model_slug,
+            a.result,
+            a.high_bid,
+            a.currency,
+            a.end_ts
+        FROM participants p
+        JOIN auctions a ON a.listing_id = p.listing_id
     """,
+
+    # selling, bidding and winning totals per member (money columns are USD-only)
+    'member_activity': """
+        WITH selling AS (
+            SELECT
+                seller_slug AS slug,
+                COUNT(*) AS listed,
+                SUM(result = 'sold') AS sold,
+                SUM(CASE WHEN result = 'sold' AND currency = 'USD' THEN high_bid END) AS sold_usd,
+                MIN(end_ts) AS first_listed_ts,
+                MAX(end_ts) AS last_listed_ts
+            FROM auctions
+            WHERE fetched_at IS NOT NULL AND seller_slug IS NOT NULL
+            GROUP BY seller_slug
+        ),
+        bidding AS (
+            SELECT
+                slug,
+                SUM(n_bids) AS bids,
+                COUNT(*) AS auctions_bid,
+                SUM(won) AS won_bid_on,
+                MIN(first_bid_ts) AS first_bid_ts,
+                MAX(last_bid_ts) AS last_bid_ts
+            FROM participants
+            GROUP BY slug
+        ),
+        winning AS (
+            SELECT
+                a.winner_slug AS slug,
+                COUNT(*) AS won,
+                SUM(CASE WHEN a.currency = 'USD' THEN a.high_bid END) AS won_usd,
+                -- a win with no parsed bid from the winner: worth a look, not a rate booster
+                SUM(p.listing_id IS NULL) AS won_without_bid
+            FROM auctions a
+            LEFT JOIN participants p ON p.listing_id = a.listing_id AND p.slug = a.winner_slug
+            WHERE a.result = 'sold' AND a.winner_slug IS NOT NULL
+            GROUP BY a.winner_slug
+        )
+        SELECT
+            m.slug,
+            m.display_name,
+            m.user_id,
+            COALESCE(s.listed, 0) AS listed,
+            COALESCE(s.sold, 0) AS sold,
+            COALESCE(s.sold_usd, 0) AS sold_usd,
+            COALESCE(b.auctions_bid, 0) AS auctions_bid,
+            COALESCE(b.bids, 0) AS bids,
+            COALESCE(w.won, 0) AS won,
+            COALESCE(w.won_usd, 0) AS won_usd,
+            COALESCE(w.won_without_bid, 0) AS won_without_bid,
+            -- of the auctions they bid on, the share they won
+            ROUND(1.0 * COALESCE(b.won_bid_on, 0) / NULLIF(b.auctions_bid, 0), 3) AS win_rate,
+            MIN(COALESCE(s.first_listed_ts, b.first_bid_ts), COALESCE(b.first_bid_ts, s.first_listed_ts)) AS first_seen_ts,
+            MAX(COALESCE(s.last_listed_ts, b.last_bid_ts), COALESCE(b.last_bid_ts, s.last_listed_ts)) AS last_seen_ts
+        FROM members m
+        LEFT JOIN selling s ON s.slug = m.slug
+        LEFT JOIN bidding b ON b.slug = m.slug
+        LEFT JOIN winning w ON w.slug = m.slug
+    """,
+
+    # how often each bidder shows up on a given seller's auctions
+    'seller_bidder_pairs': """
+        SELECT
+            seller_slug,
+            slug AS bidder_slug,
+            COUNT(*) AS auctions_bid,
+            SUM(won) AS won,
+            SUM(n_bids) AS bids
+        FROM participants
+        WHERE seller_slug IS NOT NULL
+        GROUP BY seller_slug, slug
+    """,
+
+    # every auction of every tracked vehicle, in order (undated ones last), with what changed since the previous one
+    'vehicle_timeline': """
+        SELECT
+            t.*,
+            CASE
+                WHEN t.seq = 1 THEN 'first_seen'
+                WHEN t.seller_slug IS NULL THEN 'unknown_seller'
+                WHEN t.prev_result = 'sold' AND t.seller_slug = t.prev_winner_slug THEN 'resold_by_buyer'
+                WHEN t.prev_seller_slug IS NULL OR t.prev_result IS NULL OR t.prev_result = 'unknown' THEN 'unknown_prev'
+                WHEN t.prev_result = 'sold' AND t.seller_slug = t.prev_seller_slug THEN 'relisted_after_sale'
+                WHEN t.prev_result IN ('reserve_not_met', 'withdrawn') AND t.seller_slug = t.prev_seller_slug THEN 'relisted_unsold'
+                ELSE 'new_seller'
+            END AS transition,
+            ROUND((t.end_ts - t.prev_end_ts) / 86400.0, 1) AS days_since_prev,
+            CASE WHEN t.currency = t.prev_currency THEN t.high_bid - t.prev_high_bid END AS change_since_prev
+        FROM (
+            SELECT
+                a.vehicle_id, a.listing_id, a.url, a.title, a.vin, a.chassis, a.make, a.model_slug,
+                a.end_ts, a.result, a.high_bid, a.currency, a.seller_slug, a.winner_slug,
+                ROW_NUMBER() OVER w AS seq,
+                COUNT(*) OVER (PARTITION BY a.vehicle_id) AS n_auctions,
+                LAG(a.end_ts) OVER w AS prev_end_ts,
+                LAG(a.result) OVER w AS prev_result,
+                LAG(a.high_bid) OVER w AS prev_high_bid,
+                LAG(a.currency) OVER w AS prev_currency,
+                LAG(a.seller_slug) OVER w AS prev_seller_slug,
+                LAG(a.winner_slug) OVER w AS prev_winner_slug
+            FROM auctions a
+            WHERE a.vehicle_id IS NOT NULL AND a.fetched_at IS NOT NULL
+            WINDOW w AS (PARTITION BY a.vehicle_id ORDER BY a.end_ts IS NULL, a.end_ts, a.listing_id)
+        ) t
+    """,
+
+    # cars a member won and later sold again on bat themselves (gross prices, before fees)
+    'member_resales': MEMBER_RESALES.format(scope=''),
 }
 
 
@@ -442,6 +480,9 @@ class ActivityDB:
                         raise
                     raise ValueError(f"bid {b.bid_id} is already stored under listing {owner['listing_id']}") from e
 
+            self.conn.execute("DELETE FROM participants WHERE listing_id = ?", (detail.listing_id,))
+            self.conn.execute(PARTICIPANTS_INSERT.format(where="WHERE b.listing_id = ?"), (detail.listing_id,))
+
             # links the page no longer shows go; the rest keep their follow attempts
             self.conn.execute("""
                 DELETE FROM listing_links
@@ -579,10 +620,27 @@ class ActivityDB:
                   AND listing_id IN (SELECT value FROM json_each(:ids))
             """, {'ids': json.dumps(list(listing_ids)), 'before': fetched_before or 2 ** 62}).rowcount
 
+    def rebuild_participants(self) -> int:
+        with self.conn:
+            self.conn.execute("DELETE FROM participants")
+            self.conn.execute(PARTICIPANTS_INSERT.format(where=''))
+        return self.conn.execute("SELECT COUNT(*) FROM participants").fetchone()[0]
+
     def rebuild_vehicles(self) -> dict:
         """group auctions into vehicles: same vin (or make + short chassis), or linked by bat history"""
+        # an auction without an end time sorts wrongly in its car's timeline; another listing's bat history
+        # usually knows when it ended
+        with self.conn:
+            dated = self.conn.execute("""
+                UPDATE auctions SET end_ts = (
+                    SELECT MAX(l.related_end_ts) FROM listing_links l WHERE l.related_listing_id = auctions.listing_id
+                )
+                WHERE end_ts IS NULL AND EXISTS (
+                    SELECT 1 FROM listing_links l WHERE l.related_listing_id = auctions.listing_id AND l.related_end_ts IS NOT NULL
+                )
+            """).rowcount
         rows = self.conn.execute("""
-            SELECT listing_id, make, chassis, vin, vehicle_id FROM auctions WHERE fetched_at IS NOT NULL
+            SELECT listing_id, make, model_slug, chassis, vin, vehicle_id FROM auctions WHERE fetched_at IS NOT NULL
         """).fetchall()
         links = self.conn.execute("""
             SELECT l.listing_id, l.related_listing_id FROM listing_links l
@@ -637,18 +695,52 @@ class ActivityDB:
             'repeat_vehicles': sum(1 for g in groups.values() if len(g) > 1),
             # history links can join listings whose chassis was typed differently
             'vin_conflicts': sum(1 for g in groups.values() if len({r['vin'] for r in g if r['vin']}) > 1),
+            # groups whose listings disagree on the car's key or model: a wrong merge, or a car relabelled
+            'mixed': sum(1 for g in groups.values()
+                         if len({vehicle_key(r['vin'], r['chassis'], r['make']) for r in g} - {None}) > 1
+                         or len({r['model_slug'] for r in g if r['model_slug']}) > 1),
+            'dated': dated,
             'updated': len(updates)
         }
 
+    def resales_of(self, slug: str, limit: int) -> List[sqlite3.Row]:
+        """member_resales for one member, looking only at the cars they won"""
+        scope = " AND a.vehicle_id IN (SELECT vehicle_id FROM auctions WHERE winner_slug = :slug AND vehicle_id IS NOT NULL)"
+        return self.conn.execute(f"""
+            SELECT * FROM ({MEMBER_RESALES.format(scope=scope)}) WHERE slug = :slug ORDER BY sold_ts DESC LIMIT :limit
+        """, {'slug': slug, 'limit': limit}).fetchall()
+
+    def find_vehicles(self, ref: str) -> List[sqlite3.Row]:
+        """vehicles matching a listing url, listing id, vin or chassis number, tried in that order; the first
+        kind of match that finds anything decides, so a listing id never loses to a chassis with the same digits"""
+        ref = ref.strip()
+        normalized = re.sub(r'[^A-Z0-9]', '', ref.upper())
+        slug = re.search(r'/listing/([^/?#]+)', ref)
+        tries = []
+        if slug:
+            tries.append(("url LIKE ?", f"%/listing/{slug.group(1)}/"))
+        if ref.isdigit():
+            tries.append(("listing_id = ?", int(ref)))
+        if len(normalized) == 17:
+            tries.append(("vin = ?", normalized))
+        if len(normalized) >= 5:
+            tries.append(("chassis = ?", normalized))
+
+        for condition, value in tries:
+            rows = self.conn.execute(f"""
+                SELECT vehicle_id, MIN(title) AS title, COUNT(*) AS auctions, MIN(listing_id) AS listing_id
+                FROM auctions
+                WHERE vehicle_id IN (SELECT vehicle_id FROM auctions WHERE vehicle_id IS NOT NULL AND {condition})
+                GROUP BY vehicle_id ORDER BY vehicle_id
+            """, (value,)).fetchall()
+            if rows:
+                return rows
+        return []
+
     def find_vehicle_id(self, ref: str) -> Optional[int]:
-        row = self.conn.execute("""
-            SELECT vehicle_id FROM auctions
-            WHERE vehicle_id IS NOT NULL
-              AND (vin = UPPER(:ref) OR chassis = UPPER(:ref) OR url IN (:ref, :ref || '/')
-                   OR CAST(listing_id AS TEXT) = :ref)
-            LIMIT 1
-        """, {'ref': ref.strip()}).fetchone()
-        return row['vehicle_id'] if row else None
+        """the vehicle a reference names, or None when nothing or more than one car matches"""
+        matches = self.find_vehicles(ref)
+        return matches[0]['vehicle_id'] if len(matches) == 1 else None
 
     def known_listing_ids(self, listing_ids: List[int]) -> set:
         if not listing_ids:
@@ -681,6 +773,8 @@ class ActivityDB:
         version = int(self.get_meta('schema_version') or 1)
         if version < 2 and self._url_is_unique():
             self._rebuild_auctions()
+        if version < 3:
+            self.rebuild_participants()
         if version < SCHEMA_VERSION:
             self.set_meta('schema_version', str(SCHEMA_VERSION))
 
