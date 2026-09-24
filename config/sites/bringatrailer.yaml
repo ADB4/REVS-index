@@ -10,9 +10,15 @@ robots_txt:
   disallowed_paths:
     - /wp-admin/
     - /message/
+    - /listing/*/carfax
     - /member/
+    - /*/contact/
+    - /*/feed/
     - /account/
+    - /?q=
     - /search/
+    - /*corder=
+    - /*utm_source=
 
 selectors:
   listing_page:
@@ -113,6 +119,25 @@ extraction_rules:
         - engine
         - brake
         - exhaust
+
+activity:
+  results_endpoint: /wp-json/bringatrailer/1.0/data/listings-filter
+  results_per_page: 60
+  results_sort: td
+  selectors:
+    comments_var: BAT_VMS
+    listing_id: "[data-listing-currently]"
+    title: h1.post-title
+    country: .show-country-name
+    result_info: .listing-available-info
+    bid_count: "#listing-bid .number-bids-value"
+    winner_link: "#listing-bid [data-listing-high-bidder-link] a[href*='/member/']"
+    essentials: .essentials
+    group_link: .group-link
+    group_label: .group-title-label
+    listing_details: .essentials ul li
+    history_item: .history .items a.item
+    history_summary: .message em
 
 javascript:
   load_more_listings: |

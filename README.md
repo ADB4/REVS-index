@@ -74,6 +74,105 @@ python3 cli/commands/ingest.py \
   --json-file data/json/output/normalized/e46-m3_normalized.json
 ```
 
+## seller, bidder and buyer activity
+
+`cli/commands/activity.py` tracks who sells, who bids and who wins across every completed bat auction. it doesn't use selenium: each listing page embeds its full comment thread as json (`var BAT_VMS`), so one GET per auction returns every bid with the bidder's id, amount and timestamp.
+
+two steps, both resumable (ctrl-c is safe):
+
+1. **discover**: pages through the site-wide results api (`/wp-json/bringatrailer/1.0/data/listings-filter`, 60 per page) and records each auction's id, url, result, price and end time
+2. **fetch**: downloads each discovered listing once and stores the seller, make/model, chassis/vin, every bid and the winner. it also follows the listing's "bat history" links, so earlier auctions of the same car are collected even when they fall outside the discovered window
+
+```bash
+# daily incremental run: new results, then their bid histories
+python3 cli/commands/activity.py sync
+
+# backfill history, a chunk at a time (remembers where it stopped)
+python3 cli/commands/activity.py discover --backfill --max-pages 200
+python3 cli/commands/activity.py fetch --limit 2000
+
+# or bound the backfill by date
+python3 cli/commands/activity.py sync --backfill --since 2025-01-01
+```
+
+after each fetch, auctions are grouped into vehicles (see below).
+
+requests are spaced `--delay` seconds apart (default 3s plus jitter, never below robots.txt's crawl-delay), 429/5xx responses back off, and robots-disallowed paths such as `/member/` are refused before any request is sent. at the default pace the full archive (~265k auctions) takes roughly 11–12 days, so run the backfill in chunks.
+
+### reports
+
+```bash
+python3 cli/commands/activity.py report                       # top sellers, bidders, buyers
+python3 cli/commands/activity.py report --model bmw/e46-m3    # scoped to a model (or a make: --model bmw)
+python3 cli/commands/activity.py report --member lummy1088    # one member: sold, bid on, won, counterparties
+python3 cli/commands/activity.py report --pairs               # sellers whose auctions the same bidders keep showing up on
+python3 cli/commands/activity.py report --vehicle WBSBR934X2EX23144   # every bat auction of one car (vin, chassis, url or listing id)
+python3 cli/commands/activity.py report --resales             # members who resell cars they won: hold time, price change
+```
+
+### vehicle tracking
+
+each auction gets a `vehicle_id` (the lowest listing id of that car). two auctions are the same car when either:
+
+- they share a 17-character vin, or the same chassis number within the same make (pre-1981 chassis numbers are short and repeat across makes)
+- one lists the other under "bat history", which also catches vins typed differently between listings
+
+`vehicle_timeline` labels each auction by what changed since the car's previous one:
+
+| transition | meaning |
+| --- | --- |
+| `resold_by_buyer` | the previous buyer is now the seller |
+| `relisted_after_sale` | the same seller again after a "sold" result, usually a sale that fell through |
+| `relisted_unsold` | the same seller again after reserve not met |
+| `new_seller` | someone else is selling: the car changed hands off bat, or went through a dealer |
+
+one real car, from `report --vehicle WBSBR934X2EX23144`:
+
+```
+ended       result  price    seller    buyer        what happened        days since prev  price change
+2015-09-09  sold    $12,750  willousb  flsandman    first seen           -                -
+2015-09-14  sold    $13,000  willousb  NIACC        relisted after sale  5                +$250
+2019-07-29  sold    $13,500  NIACC     drc354       resold by buyer      1,414            +$500
+2021-10-03  sold    $17,000  drc354    Szvc         resold by buyer      797              +$3,500
+2023-02-12  sold    $18,500  Szvc      WSomerville  resold by buyer      497              +$1,500
+```
+
+prices are hammer prices: buyer's fees, shipping and any work done while the car was held are not included.
+
+```bash
+# fetch one car and its whole bat history
+python3 cli/commands/activity.py fetch --url https://bringatrailer.com/listing/2002-bmw-m3-convertible-106/
+
+# regroup vehicles without fetching anything
+python3 cli/commands/activity.py link
+
+# re-fetch listings saved by an older version of the parser (e.g. before vins were captured)
+python3 cli/commands/activity.py fetch --upgrade
+```
+
+### schema
+
+data lives in `data/db/bat_activity.db` (sqlite). members are keyed by their `/member/<slug>/` slug, which is the same whether they appear as a seller, bidder or buyer.
+
+| table / view | contents |
+| --- | --- |
+| `auctions` | one row per listing: result, price, end time, make/model, seller, high bidder, winner, bid counts |
+| `bids` | one row per bid: listing, bidder, amount, timestamp |
+| `members` | slug, display name, numeric user id |
+| `auction_participants` | one row per member per auction bid on: bid count, max bid, won |
+| `member_activity` | per-member totals for selling, bidding and winning (money columns are USD only) |
+| `seller_bidder_pairs` | how often each bidder bids on / wins each seller's auctions |
+| `listing_links` | "bat history" links from a listing to other auctions of the same car, with bat's "sold by x to y" summary |
+| `vehicle_timeline` | every auction of every tracked car in order, with transition, days since previous and price change |
+| `member_resales` | cars a member won and later sold again on bat: price paid, resale price, days held |
+
+two consistency checks show up in `report`:
+
+- `auctions.bids_reported` is the page's own bid counter. `report` flags listings where it disagrees with the bids parsed from the page
+- bat history's "sold by x to y" text is compared with the stored seller and buyer of each linked sale
+
+older databases are upgraded in place when opened. listings saved before vin capture need `fetch --upgrade` to pick up chassis numbers and history links.
+
 ## adding a new site
 
 ### step 1: create site configuration
