@@ -5,7 +5,13 @@ import time
 import hashlib
 import sqlite3
 import argparse
+from contextlib import contextmanager
 from datetime import datetime, timezone
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 
 import yaml
 
@@ -32,8 +38,70 @@ STOP_HINTS = {
 }
 
 
+# exit statuses besides 0 and 1
+EXIT_STOPPED = 2        # the site pushed back, or failures in a row stopped the run
+EXIT_LOCKED = 75        # another run holds the database (EX_TEMPFAIL): try again later
+EXIT_INTERRUPTED = 130
+
+# commands that write to the database take its lock; report only reads
+LOCKED_COMMANDS = ('discover', 'fetch', 'sync', 'link', 'reparse', 'reset-errors')
+
+# fetch --recheck-mismatches: saved listings whose page counted a different number of bids than were parsed
+MISMATCH_WHERE = "fetched_at IS NOT NULL AND bids_reported IS NOT NULL AND bids_reported != n_bids"
+
+
 def parse_date(value: str) -> int:
     return int(datetime.strptime(value, '%Y-%m-%d').replace(tzinfo=timezone.utc).timestamp())
+
+
+def date_arg(value: str) -> int:
+    try:
+        return parse_date(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a date like 2025-01-31")
+
+
+def positive_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a whole number")
+    if number < 1:
+        raise argparse.ArgumentTypeError(f"must be 1 or more, got {number}")
+    return number
+
+
+def non_negative_float(value: str) -> float:
+    try:
+        number = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a number")
+    if number < 0:
+        raise argparse.ArgumentTypeError(f"must be 0 or more, got {value}")
+    return number
+
+
+class LockHeld(Exception):
+    pass
+
+
+@contextmanager
+def run_lock(db_path: str):
+    """one crawler per database: a second run would trail the first through the same queue"""
+    if fcntl is None or db_path == ':memory:':
+        yield
+        return
+    lock_file = open(os.path.abspath(db_path) + '.lock', 'a')
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lock_file.close()
+        raise LockHeld(f"another run is using {db_path}")
+    try:
+        yield
+    finally:
+        fcntl.flock(lock_file, fcntl.LOCK_UN)
+        lock_file.close()
 
 
 def fmt_utc(ts: float) -> str:
@@ -62,7 +130,9 @@ def build_pipeline(args, db: ActivityDB, config: dict, raw_store: RawStore) -> A
 
 
 def scope_ids(args, db: ActivityDB, parser: argparse.ArgumentParser):
-    """listing ids from --where or --ids-from, or None when neither was given"""
+    """listing ids from --where, --ids-from or --recheck-mismatches, or None when none was given"""
+    if getattr(args, 'recheck_mismatches', False):
+        return db.listing_ids_where(MISMATCH_WHERE)
     if getattr(args, 'where', None):
         try:
             return db.listing_ids_where(args.where)
@@ -84,7 +154,7 @@ def scope_ids(args, db: ActivityDB, parser: argparse.ArgumentParser):
 
 def mark_scope_stale(db: ActivityDB, args, ids) -> int:
     """queue a scope for re-fetching; rerunning the same scope after an interruption resumes instead of restarting"""
-    scope = args.where or 'ids:' + hashlib.sha1(','.join(map(str, sorted(ids))).encode()).hexdigest()
+    scope = getattr(args, 'where', None) or 'ids:' + hashlib.sha1(','.join(map(str, sorted(ids))).encode()).hexdigest()
     saved = json.loads(db.get_meta('refetch_scope') or '{}')
     since = saved['since'] if saved.get('scope') == scope else int(time.time())
     db.set_meta('refetch_scope', json.dumps({'scope': scope, 'since': since}))
@@ -94,10 +164,13 @@ def mark_scope_stale(db: ActivityDB, args, ids) -> int:
 def run_discover(args, pipeline: ActivityPipeline) -> dict:
     print("discovering completed auctions...")
     print("=" * 70)
+    if args.reset_backfill_cursor:
+        pipeline.db.delete_meta('backfill_next_page')
+        print("  backfill cursor reset to page 1")
     stats = pipeline.discover(
         start_page=args.start_page,
         max_pages=args.max_pages,
-        since_ts=parse_date(args.since) if args.since else None,
+        since_ts=args.since,
         stop_after_known=args.stop_after_known,
         backfill=args.backfill
     )
@@ -105,17 +178,18 @@ def run_discover(args, pipeline: ActivityPipeline) -> dict:
     return stats
 
 
-def run_fetch(args, pipeline: ActivityPipeline, urls=None, listing_ids=None) -> dict:
+def run_fetch(args, pipeline: ActivityPipeline, urls=None, listing_ids=None, due_refetches=False, rescan=False) -> dict:
     print("fetching bid histories...")
     print("=" * 70)
     stats = pipeline.fetch(
         limit=args.limit,
-        since_ts=parse_date(args.since) if args.since else None,
+        since_ts=args.since,
         max_attempts=args.max_attempts,
-        upgrade=args.upgrade or listing_ids is not None,
+        upgrade=args.upgrade or rescan,
         follow_history=not args.no_follow_history,
         urls=urls,
-        listing_ids=listing_ids
+        listing_ids=listing_ids,
+        due_refetches=due_refetches
     )
     print(f"\n{stats['fetched']} auction(s) saved, {stats['bids']} bids, "
           f"{stats['followed']} history links followed, {stats['failed']} failed")
@@ -198,7 +272,7 @@ def auction_filters(args, alias: str):
         params += [args.model, f"{args.model}/%"]
     if args.since:
         clauses.append(f"{alias}.end_ts >= ?")
-        params.append(parse_date(args.since))
+        params.append(args.since)
     return ''.join(f" AND {c}" for c in clauses), params
 
 
@@ -250,6 +324,13 @@ def report_overview(db: ActivityDB, raw_path=None):
     print(f"  bids                : {counts['bids']:,}")
     print(f"  vehicles tracked    : {vehicles['vehicles'] or 0:,} ({vehicles['repeat_vehicles'] or 0:,} auctioned more than once)")
 
+    # rows discovery stored carry its no_reserve flag; history-followed ones don't until the feed lists them
+    feed_total = db.get_meta('feed_items_total')
+    if feed_total:
+        from_feed = db.query("SELECT COUNT(*) AS n FROM auctions WHERE no_reserve IS NOT NULL")[0]['n']
+        print(f"  results feed        : lists {int(feed_total):,} completed auctions, {from_feed:,} of them stored "
+              f"({int(feed_total) - from_feed:,} not discovered yet)")
+
     # bat history on a later listing says "Sold by X to Y" for each earlier one: an independent check on our parsing
     checks = db.query("""
         SELECT
@@ -279,7 +360,7 @@ def report_overview(db: ActivityDB, raw_path=None):
 
 def report_leaderboards(db: ActivityDB, args):
     where, params = auction_filters(args, 'a')
-    scope = f" ({args.model or 'all models'}{', since ' + args.since if args.since else ''})"
+    scope = f" ({args.model or 'all models'}{', since ' + fmt_ts(args.since) if args.since else ''})"
 
     sellers = db.query(f"""
         SELECT a.seller_slug AS slug, m.display_name, MAX(a.seller_type) AS seller_type,
@@ -381,10 +462,10 @@ def report_resales(db: ActivityDB, args):
         params += [args.model, f"{args.model}/%"]
     if args.since:
         clauses.append("r.sold_ts >= ?")
-        params.append(parse_date(args.since))
+        params.append(args.since)
     where = ''.join(f" AND {c}" for c in clauses)
     min_resales = args.min_auctions or 2
-    scope = f" ({args.model or 'all models'}{', resold since ' + args.since if args.since else ''})"
+    scope = f" ({args.model or 'all models'}{', resold since ' + fmt_ts(args.since) if args.since else ''})"
 
     members = db.query(f"""
         SELECT r.slug, m.display_name, COUNT(*) AS resold, SUM(r.price_change > 0) AS gains,
@@ -493,12 +574,14 @@ def report_member(db: ActivityDB, args):
 
 
 def add_discover_args(p):
-    p.add_argument('--max-pages', type=int, help='stop after this many results pages')
-    p.add_argument('--start-page', type=int, help='results page to start from')
+    p.add_argument('--max-pages', type=positive_int, help='stop after this many results pages')
+    p.add_argument('--start-page', type=positive_int, help='results page to start from')
+    p.add_argument('--reset-backfill-cursor', action='store_true', help='start the backfill over from page 1')
     p.add_argument('--backfill', action='store_true',
                    help='walk back through history without stopping at known auctions; resumes where the last backfill stopped')
-    p.add_argument('--stop-after-known', type=int, default=2,
-                   help='incremental mode: stop after this many pages with no new auctions')
+    p.add_argument('--stop-after-known', type=positive_int, default=2,
+                   help='incremental mode: stop after this many pages with nothing new, counting only pages older '
+                        'than what the last complete run had already seen')
 
 
 def add_scope_args(p, verb):
@@ -510,8 +593,9 @@ def add_scope_args(p, verb):
 
 
 def add_fetch_args(p):
-    p.add_argument('--limit', type=int, help='fetch at most this many listing pages')
-    p.add_argument('--max-attempts', type=int, default=3, help='give up on a listing after this many failures')
+    p.add_argument('--limit', type=positive_int, help='fetch at most this many listing pages, bat history links included')
+    p.add_argument('--max-attempts', type=positive_int, default=3,
+                   help='give up on a listing after this many failures (reset-errors clears them)')
     p.add_argument('--upgrade', action='store_true',
                    help='also re-fetch listings saved by an older parser version (e.g. before vin tracking)')
     p.add_argument('--no-follow-history', action='store_true',
@@ -531,14 +615,20 @@ def main(argv=None):
     add_fetch_args(fetch)
     scope = add_scope_args(fetch, 're-fetch')
     scope.add_argument('--url', nargs='+', help='fetch these listing urls (and their bat history) instead of the queue')
+    scope.add_argument('--recheck-mismatches', action='store_true',
+                       help="re-fetch saved listings whose page counted a different number of bids than were parsed")
 
-    sync = sub.add_parser('sync', help='discover new results, then fetch their bid histories')
+    sync = sub.add_parser('sync', help='discover new results, then fetch what was just discovered')
     add_discover_args(sync)
     add_fetch_args(sync)
+    sync.add_argument('--all', action='store_true',
+                      help='fetch the whole queue, not just what this run discovered and re-fetches that are due')
 
     for p in (discover, fetch, sync):
-        p.add_argument('--since', help='only auctions ending on or after YYYY-MM-DD')
-        p.add_argument('--delay', type=float, default=3.0, help='seconds between requests (robots crawl-delay is the floor)')
+        p.add_argument('--since', type=date_arg,
+                       help='only auctions ending on or after YYYY-MM-DD (bat history links from them are still followed)')
+        p.add_argument('--delay', type=non_negative_float, default=3.0,
+                       help='seconds between requests (robots crawl-delay is the floor)')
 
     sub.add_parser('link', help='regroup fetched auctions into vehicles by vin and bat history (no network)')
     reparse = sub.add_parser('reparse', help='run the current parser over stored pages again (no network)')
@@ -547,14 +637,14 @@ def main(argv=None):
                    help='clear failure counts so listings and history links that hit --max-attempts are tried again (no network)')
 
     report = sub.add_parser('report', help='summarize selling, bidding and winning activity')
-    report.add_argument('--top', type=int, default=15, help='rows per table')
+    report.add_argument('--top', type=positive_int, default=15, help='rows per table')
     report.add_argument('--model', help='make or model slug, e.g. bmw or bmw/e46-m3')
-    report.add_argument('--since', help='only auctions ending on or after YYYY-MM-DD')
+    report.add_argument('--since', type=date_arg, help='only auctions ending on or after YYYY-MM-DD')
     report.add_argument('--member', help='member slug for a single-member profile')
     report.add_argument('--vehicle', help='vin, chassis number, listing url or listing id: every bat auction of that car')
     report.add_argument('--resales', action='store_true', help='members who resell cars they won, with hold time and price change')
     report.add_argument('--pairs', action='store_true', help='show repeat seller/bidder relationships')
-    report.add_argument('--min-auctions', type=int,
+    report.add_argument('--min-auctions', type=positive_int,
                         help='minimum shared auctions for --pairs (default 3) or resales for --resales (default 2)')
 
     args = parser.parse_args(argv)
@@ -567,6 +657,17 @@ def main(argv=None):
         except ValueError as e:
             parser.error(f"--url: {e}")
 
+    if args.command not in LOCKED_COMMANDS:
+        return run_command(args, parser, config, urls)
+    try:
+        with run_lock(args.db):
+            return run_command(args, parser, config, urls)
+    except LockHeld as e:
+        print(f"{e}; not starting a second run")
+        return EXIT_LOCKED
+
+
+def run_command(args, parser: argparse.ArgumentParser, config: dict, urls) -> int:
     db = ActivityDB(args.db)
     raw_path = args.raw_db or raw_db_path(args.db)
     raw_store = None
@@ -612,29 +713,35 @@ def main(argv=None):
         pipeline = build_pipeline(args, db, config, raw_store)
         status = 0
         try:
+            discovered = None
             if args.command in ('discover', 'sync'):
-                run_discover(args, pipeline)
+                discovered = run_discover(args, pipeline)
             if args.command in ('fetch', 'sync'):
                 ids = scope_ids(args, db, parser)
-                if ids is not None:
+                rescan = ids is not None
+                if rescan:
                     marked = mark_scope_stale(db, args, ids)
                     print(f"{len(ids):,} listing(s) in scope, {marked:,} newly queued for a re-fetch")
-                stats = run_fetch(args, pipeline, urls, ids)
-                if ids is not None and not db.pending(max_attempts=args.max_attempts, upgrade_below=PARSER_VERSION, listing_ids=ids):
+                # a daily sync fetches what it just discovered (and re-fetches that are due), not the whole backlog
+                daily = args.command == 'sync' and not args.all
+                if daily:
+                    ids = discovered['seen_ids']
+                stats = run_fetch(args, pipeline, urls, ids, due_refetches=daily, rescan=rescan)
+                if rescan and not db.pending(max_attempts=args.max_attempts, upgrade_below=PARSER_VERSION, listing_ids=ids):
                     db.delete_meta('refetch_scope')
                 if stats['fetched'] == 0 and stats['failed'] > 0:
                     status = 1
         except KeyboardInterrupt:
             print("\ninterrupted, progress so far is saved")
-            status = 130
+            status = EXIT_INTERRUPTED
         except RateLimited as e:
             print(f"\nstopped: {e}")
             print(f"resume after {fmt_utc(e.resume_at)}")
-            status = 2
+            status = EXIT_STOPPED
         except (SiteUnavailable, CircuitOpen) as e:
             print(f"\nstopped: {e}")
             print(STOP_HINTS[getattr(e, 'kind', 'site')])
-            status = 2
+            status = EXIT_STOPPED
         print(f"{pipeline.client.request_count} request(s) made, database at {args.db}")
         return status
     finally:

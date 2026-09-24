@@ -296,7 +296,8 @@ class ActivityDB:
     def __init__(self, path: str):
         if path != ':memory:':
             os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        self.conn = sqlite3.connect(path)
+        # another writer (a sqlite shell, a report's long read) gets a minute before a save gives up
+        self.conn = sqlite3.connect(path, timeout=60)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute('PRAGMA journal_mode=WAL')
         self.conn.execute('PRAGMA foreign_keys=ON')
@@ -369,8 +370,10 @@ class ActivityDB:
 
         return len([s for s in stored if s.listing_id not in known])
 
-    def save_detail(self, detail: AuctionDetail, now: int, parser_version: int, requested_url: Optional[str] = None) -> None:
-        """store a parsed listing; requested_url is the url fetched, when a redirect or canonical link differs"""
+    def save_detail(self, detail: AuctionDetail, now: int, parser_version: int, requested_url: Optional[str] = None,
+                    note: Optional[str] = None) -> None:
+        """store a parsed listing; requested_url is the url fetched, when a redirect or canonical link differs.
+        a note (e.g. a bid count that doesn't match the page) is kept in fetch_error on the saved row"""
         members = [detail.seller, detail.high_bidder, detail.winner] + [b.bidder for b in detail.bids]
 
         with self.conn:
@@ -403,7 +406,7 @@ class ActivityDB:
                     parser_version = ?,
                     refetch = 0,
                     fetch_attempts = 0,
-                    fetch_error = NULL
+                    fetch_error = ?
                 WHERE listing_id = ?
             """, (
                 detail.title,
@@ -421,6 +424,7 @@ class ActivityDB:
                 len(detail.bids), detail.bids_reported, detail.n_comments,
                 now,
                 parser_version,
+                note,
                 detail.listing_id
             ))
 
@@ -500,14 +504,28 @@ class ActivityDB:
         upgrade_below: Optional[int] = None,
         listing_ids: Optional[Iterable[int]] = None,
         now: Optional[float] = None,
-        grace: int = REFETCH_GRACE
+        grace: int = REFETCH_GRACE,
+        fetched_only: bool = False
     ) -> List[sqlite3.Row]:
         """listings to fetch: never fetched, flagged for a re-fetch, possibly saved before they were final,
-        reserve-not-met ones whose deal window has passed, and (with upgrade_below) older parser versions"""
+        reserve-not-met ones whose deal window has passed, and (with upgrade_below) older parser versions.
+        fetched_only leaves out the never-fetched backlog"""
+        where, params = self._pending_where(since_ts, max_attempts, upgrade_below, listing_ids, now, grace, fetched_only)
+        sql = f"SELECT listing_id, url, end_ts FROM auctions WHERE {where} ORDER BY fetched_at IS NOT NULL, end_ts DESC"
+        if limit is not None:
+            sql += " LIMIT :limit"
+            params['limit'] = limit
+        return self.conn.execute(sql, params).fetchall()
+
+    def pending_count(self, since_ts: Optional[int] = None, max_attempts: int = 3, upgrade_below: Optional[int] = None,
+                      listing_ids: Optional[Iterable[int]] = None, fetched_only: bool = False) -> int:
+        where, params = self._pending_where(since_ts, max_attempts, upgrade_below, listing_ids, None, REFETCH_GRACE, fetched_only)
+        return self.conn.execute(f"SELECT COUNT(*) FROM auctions WHERE {where}", params).fetchone()[0]
+
+    def _pending_where(self, since_ts, max_attempts, upgrade_below, listing_ids, now, grace, fetched_only):
         stale = " OR COALESCE(parser_version, 0) < :upgrade" if upgrade_below else ""
-        sql = f"""
-            SELECT listing_id, url, end_ts FROM auctions
-            WHERE fetch_attempts < :max_attempts AND (
+        where = f"""
+            fetch_attempts < :max_attempts AND (
                 fetched_at IS NULL
                 OR refetch = 1
                 OR fetched_at < end_ts + :frozen
@@ -517,17 +535,15 @@ class ActivityDB:
         """
         params = {'max_attempts': max_attempts, 'upgrade': upgrade_below, 'frozen': FROZEN_MARGIN, 'grace': grace,
                   'now': int(time.time() if now is None else now)}
+        if fetched_only:
+            where += " AND fetched_at IS NOT NULL"
         if since_ts:
-            sql += " AND end_ts >= :since"
+            where += " AND end_ts >= :since"
             params['since'] = since_ts
         if listing_ids is not None:
-            sql += " AND listing_id IN (SELECT value FROM json_each(:ids))"
+            where += " AND listing_id IN (SELECT value FROM json_each(:ids))"
             params['ids'] = json.dumps(list(listing_ids))
-        sql += " ORDER BY fetched_at IS NOT NULL, end_ts DESC"
-        if limit is not None:
-            sql += " LIMIT :limit"
-            params['limit'] = limit
-        return self.conn.execute(sql, params).fetchall()
+        return where, params
 
     def pending_history(self, max_attempts: int = 3) -> List[sqlite3.Row]:
         return self.conn.execute("""
@@ -536,7 +552,7 @@ class ActivityDB:
             WHERE related_listing_id IS NULL
             GROUP BY related_url
             HAVING MAX(follow_attempts) < ?
-            ORDER BY MAX(related_end_ts) DESC
+            ORDER BY MAX(related_end_ts) DESC, MIN(rowid)
         """, (max_attempts,)).fetchall()
 
     def needs_fetch(self, url: str, max_attempts: int = 3) -> bool:

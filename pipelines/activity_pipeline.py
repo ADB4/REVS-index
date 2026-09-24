@@ -1,8 +1,9 @@
 import time
+import sqlite3
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from sites.bringatrailer.http_client import BaTClient, RateLimited, SiteUnavailable, challenge_marker
+from sites.bringatrailer.http_client import BaTClient, HTTPStatusError, RateLimited, SiteUnavailable, challenge_marker
 from sites.bringatrailer.activity_parser import (
     ActivityParser, ListingParseError, NotFinal, PARSER_VERSION, parse_results_page
 )
@@ -17,6 +18,9 @@ MAX_FAILURES_IN_A_ROW = 20
 # the results feed only lists finished auctions, so finished ones without the ended marker mean
 # the marker was renamed, and the finality check would otherwise skip every page from here on
 MAX_UNMARKED_ENDED_IN_A_ROW = 5
+# incremental discovery only counts a known page toward its stop streak once the page is this far below the
+# newest auction a completed run had seen: pages above that may have been stored by a run that was cut short
+WATERMARK_MARGIN = 6 * 3600
 
 
 class CircuitOpen(Exception):
@@ -70,26 +74,44 @@ class ActivityPipeline:
         stop_after_known: int = 2,
         backfill: bool = False
     ) -> dict:
+        cursor = int(self.db.get_meta('backfill_next_page') or 1)
         if start_page is None:
-            start_page = int(self.db.get_meta('backfill_next_page') or 1) if backfill else 1
+            start_page = cursor if backfill else 1
+        elif backfill and start_page > cursor:
+            print(f"  --start-page {start_page} is past the backfill cursor ({cursor}), so the cursor stays put")
+        watermark = self.db.get_meta('discover_watermark')
+        watermark = int(watermark) if watermark else None
 
         page = start_page
         pages_done = 0
         known_streak = 0
         new_total = 0
-        seen_total = 0
+        seen_ids = []
+        # the newest auction on page 1, and whether this run walked far enough to vouch for everything below it
+        top = None
+        complete = False
 
-        while not max_pages or pages_done < max_pages:
-            data = self.client.get_json(self.endpoint, params={
-                'page': page,
-                'per_page': self.per_page,
-                'get_items': 1,
-                'get_stats': 0,
-                'sort': self.sort
-            })
+        while max_pages is None or pages_done < max_pages:
+            try:
+                data = self.client.get_json(self.endpoint, params={
+                    'page': page,
+                    'per_page': self.per_page,
+                    'get_items': 1,
+                    'get_stats': 0,
+                    'sort': self.sort
+                })
+            except HTTPStatusError as e:
+                # asking for a page past the last one can get a 400 instead of an empty list
+                if e.status == 400 and page > 1:
+                    print(f"  page {page}: http 400, taken as past the last page")
+                    complete = True
+                    break
+                raise
+
             summaries = parse_results_page(data)
             if not summaries:
                 print("  no more results")
+                complete = True
                 break
 
             skipped = []
@@ -100,33 +122,51 @@ class ActivityPipeline:
             for listing_id, error in skipped:
                 print(f"    couldn't store listing {listing_id}: {error}")
             new_total += new
-            seen_total += len(summaries)
+            seen_ids += [s.listing_id for s in summaries]
             pages_done += 1
+            if data.get('items_total'):
+                self.db.set_meta('feed_items_total', str(data['items_total']))
 
             end_times = [s.end_ts for s in summaries if s.end_ts]
             oldest = min(end_times) if end_times else None
-            pages_total = data.get('pages_total') or page
-            print(f"  page {page}/{pages_total}: {len(summaries)} auctions, {new} new (back to {fmt_ts(oldest)})")
+            if page == 1 and end_times:
+                top = max(end_times)
+                # the backfill covers everything below its first page; incremental runs cover what ends after it
+                if backfill and watermark is None:
+                    self.db.set_meta('discover_watermark', str(top))
+            pages_total = data.get('pages_total')
+            print(f"  page {page}/{pages_total or '?'}: {len(summaries)} auctions, {new} new (back to {fmt_ts(oldest)})")
 
-            if backfill:
-                self.db.set_meta('backfill_next_page', str(page + 1))
+            # only a page that continues where the saved cursor stopped moves it, so a jump ahead skips nothing
+            if backfill and page == cursor:
+                cursor = page + 1
+                self.db.set_meta('backfill_next_page', str(cursor))
 
+            below_watermark = watermark is None or (oldest is not None and oldest < watermark - WATERMARK_MARGIN)
             if since_ts and oldest and oldest < since_ts:
                 print(f"  reached --since {fmt_ts(since_ts)}")
+                complete = below_watermark
                 break
 
             if not backfill:
-                known_streak = known_streak + 1 if new == 0 else 0
+                known_streak = known_streak + 1 if new == 0 and below_watermark else 0
                 if known_streak >= stop_after_known:
                     print(f"  {known_streak} page(s) with nothing new, caught up")
+                    complete = True
                     break
 
-            if page >= pages_total:
+            # a missing pages_total means walking on until a page comes back empty
+            if pages_total and page >= pages_total:
                 print("  reached last page")
+                complete = True
                 break
             page += 1
 
-        return {'pages': pages_done, 'seen': seen_total, 'new': new_total}
+        # an interrupted run, or one cut short by --max-pages, leaves the watermark where it was
+        if not backfill and start_page == 1 and complete and top:
+            self.db.set_meta('discover_watermark', str(top))
+
+        return {'pages': pages_done, 'seen': len(seen_ids), 'new': new_total, 'seen_ids': seen_ids, 'complete': complete}
 
     def fetch(
         self,
@@ -136,17 +176,26 @@ class ActivityPipeline:
         upgrade: bool = False,
         follow_history: bool = True,
         urls: Optional[List[str]] = None,
-        listing_ids: Optional[List[int]] = None
+        listing_ids: Optional[List[int]] = None,
+        due_refetches: bool = False
     ) -> dict:
-        """listing_ids limits the queue to those listings (a scoped re-fetch); links found on them are still followed"""
+        """listing_ids limits the queue to those listings (what a sync just discovered, or a scoped re-fetch), and
+        due_refetches adds already-fetched listings whose re-fetch is due. links found on fetched pages are always
+        followed, straight after the page that listed them, and count against limit like any other fetch"""
+        upgrade_below = PARSER_VERSION if upgrade else None
         if urls:
-            queue = [{'listing_id': None, 'url': url, 'end_ts': None} for url in urls]
+            queue = [{'listing_id': None, 'url': url, 'end_ts': None, 'source': 'url'} for url in urls]
+            waiting = len(queue)
         else:
-            rows = self.db.pending(limit, since_ts, max_attempts, upgrade_below=PARSER_VERSION if upgrade else None,
-                                   listing_ids=listing_ids)
-            queue = [dict(r) for r in rows]
-            if follow_history and listing_ids is None:
-                queue += [dict(r) for r in self.db.pending_history(max_attempts)]
+            # links left over from earlier runs go first, so a --limit budget finishes the chains it started
+            history = self.db.pending_history(max_attempts) if follow_history and listing_ids is None else []
+            rows = list(self.db.pending(limit, since_ts, max_attempts, upgrade_below, listing_ids))
+            if due_refetches:
+                rows += self.db.pending(limit, since_ts, max_attempts, fetched_only=True)
+            queue = [dict(r, source='history') for r in history] + [dict(r, source='queue') for r in rows]
+            waiting = len(history) + self.db.pending_count(since_ts, max_attempts, upgrade_below, listing_ids)
+            if due_refetches:
+                waiting += self.db.pending_count(since_ts, max_attempts, fetched_only=True)
 
         queued = set()
         unique = []
@@ -155,7 +204,8 @@ class ActivityPipeline:
                 queued.add(row['url'])
                 unique.append(row)
         queue = unique
-        print(f"  {len(queue)} auction(s) waiting for bid history")
+        budget = f", this run fetches up to {limit}" if limit is not None and limit < waiting else ''
+        print(f"  {waiting} auction(s) waiting for bid history{budget}")
 
         fetched = 0
         failed = 0
@@ -168,7 +218,7 @@ class ActivityPipeline:
         unmarked_ended = 0
 
         try:
-            while i < len(queue) and (not limit or i < limit):
+            while i < len(queue) and (limit is None or i < limit):
                 row = queue[i]
                 i += 1
                 now = time.time()
@@ -182,22 +232,27 @@ class ActivityPipeline:
 
                     for note in detail.notes:
                         print(f"    {row['url']}: {note}")
+                    mismatch = None
                     if detail.bids_reported is not None and detail.bids_reported != len(detail.bids):
-                        print(f"    bid count mismatch for {row['url']}: page says {detail.bids_reported}, parsed {len(detail.bids)}")
+                        mismatch = f"bid count mismatch: page says {detail.bids_reported}, parsed {len(detail.bids)}"
+                        print(f"    {mismatch} at {row['url']}")
 
                     self._store_raw(page, detail, fragments, now)
-                    self.db.save_detail(detail, int(now), PARSER_VERSION, requested_url=row['url'])
+                    self.db.save_detail(detail, int(now), PARSER_VERSION, requested_url=row['url'], note=mismatch)
                     fetched += 1
                     bids += len(detail.bids)
+                    if row['source'] == 'history':
+                        followed += 1
                     site_failures = failures = unmarked_ended = 0
 
                     # earlier (or later) auctions of the same car, so its ownership chain is complete
                     if follow_history:
-                        for link in detail.history:
-                            if link.url not in queued and self.db.needs_fetch(link.url, max_attempts):
-                                queue.append({'listing_id': None, 'url': link.url, 'end_ts': link.end_ts})
-                                queued.add(link.url)
-                                followed += 1
+                        links = [link for link in detail.history
+                                 if link.url not in queued and self.db.needs_fetch(link.url, max_attempts)]
+                        for offset, link in enumerate(links):
+                            queue.insert(i + offset, {'listing_id': None, 'url': link.url, 'end_ts': link.end_ts,
+                                                      'source': 'history'})
+                            queued.add(link.url)
 
                 except RateLimited:
                     raise
@@ -304,7 +359,11 @@ class ActivityPipeline:
         self.raw_store.put(detail.listing_id, page.url, int(now), PARSER_VERSION, kind, html)
 
     def _record_failure(self, row: dict, error: Exception, count_attempt: bool):
-        if row['listing_id']:
-            self.db.mark_error(row['listing_id'], str(error), count_attempt)
-        else:
-            self.db.mark_url_error(row['url'], str(error), count_attempt)
+        # a busy or broken database here mustn't end the run; the listing just stays queued as it was
+        try:
+            if row['listing_id']:
+                self.db.mark_error(row['listing_id'], str(error), count_attempt)
+            else:
+                self.db.mark_url_error(row['url'], str(error), count_attempt)
+        except sqlite3.Error as e:
+            print(f"    couldn't record that failure ({e})")

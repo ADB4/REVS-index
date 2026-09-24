@@ -41,6 +41,7 @@ logs/
 *.db
 *.db-wal
 *.db-shm
+*.db.lock
 *.sqlite
 *.sqlite3
 
