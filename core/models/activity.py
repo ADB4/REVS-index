@@ -63,6 +63,8 @@ class AuctionDetail:
     category: Optional[str] = None
 
     chassis: Optional[str] = None
+    # the text after "Chassis:" as the page shows it
+    chassis_raw: Optional[str] = None
     vin: Optional[str] = None
     history: List[HistoryLink] = field(default_factory=list)
 
@@ -71,3 +73,5 @@ class AuctionDetail:
     n_comments: int = 0
     bids_reported: Optional[int] = None
     bids: List[Bid] = field(default_factory=list)
+    # oddities worth a line in the fetch log that don't stop the save
+    notes: List[str] = field(default_factory=list)

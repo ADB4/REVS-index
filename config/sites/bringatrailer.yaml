@@ -138,6 +138,9 @@ activity:
     listing_details: .essentials ul li
     history_item: .history .items a.item
     history_summary: .message em
+    # present on every finished listing; a live auction has neither
+    ended_marker: "#listing-bid.ended, #listing-bid-container.listing-closed"
+    canonical: link[rel=canonical]
 
 javascript:
   load_more_listings: |

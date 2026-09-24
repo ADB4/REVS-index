@@ -6,7 +6,13 @@ from typing import List, Optional
 from core.models.activity import AuctionSummary, AuctionDetail, Member
 
 
+# a parts listing can quote its donor car's vin; only bat history ties one to a car
+PARTS_MAKE = 'Parts and Automobilia'
+
+
 def vehicle_key(vin: Optional[str], chassis: Optional[str], make: Optional[str]) -> Optional[str]:
+    if make == PARTS_MAKE:
+        return None
     if vin:
         return vin
     # short pre-1981 chassis numbers are only unique within a make
@@ -34,6 +40,7 @@ CREATE TABLE IF NOT EXISTS auctions (
     origin TEXT,
     category TEXT,
     chassis TEXT,
+    chassis_raw TEXT,
     vin TEXT,
     vehicle_id INTEGER,
     country_code TEXT,
@@ -93,6 +100,7 @@ ADDED_COLUMNS = [
     ('auctions', 'vin', 'TEXT'),
     ('auctions', 'vehicle_id', 'INTEGER'),
     ('auctions', 'parser_version', 'INTEGER'),
+    ('auctions', 'chassis_raw', 'TEXT'),
 ]
 
 INDEXES = """
@@ -320,7 +328,8 @@ class ActivityDB:
 
         return len([s for s in summaries if s.listing_id not in known])
 
-    def save_detail(self, detail: AuctionDetail, now: int, parser_version: int) -> None:
+    def save_detail(self, detail: AuctionDetail, now: int, parser_version: int, requested_url: Optional[str] = None) -> None:
+        """store a parsed listing; requested_url is the url fetched, when a redirect or canonical link differs"""
         members = [detail.seller, detail.high_bidder, detail.winner] + [b.bidder for b in detail.bids]
 
         with self.conn:
@@ -333,18 +342,20 @@ class ActivityDB:
                 ON CONFLICT(listing_id) DO NOTHING
             """, (detail.listing_id, detail.url, now))
 
+            # a field the page didn't yield never blanks one an earlier fetch stored
             self.conn.execute("""
                 UPDATE auctions SET
                     title = COALESCE(?, title),
-                    make = ?, model = ?, model_slug = ?, era = ?, origin = ?, category = ?,
-                    chassis = ?, vin = ?,
-                    country = ?, location = ?,
-                    result = ?,
+                    make = COALESCE(?, make), model = COALESCE(?, model), model_slug = COALESCE(?, model_slug),
+                    era = COALESCE(?, era), origin = COALESCE(?, origin), category = COALESCE(?, category),
+                    chassis = COALESCE(?, chassis), chassis_raw = COALESCE(?, chassis_raw), vin = COALESCE(?, vin),
+                    country = COALESCE(?, country), location = COALESCE(?, location),
+                    result = COALESCE(NULLIF(?, 'unknown'), result),
                     high_bid = COALESCE(?, high_bid),
                     currency = COALESCE(?, currency),
                     end_ts = COALESCE(?, end_ts),
-                    lot_number = ?,
-                    seller_slug = ?, seller_type = ?,
+                    lot_number = COALESCE(?, lot_number),
+                    seller_slug = COALESCE(?, seller_slug), seller_type = COALESCE(?, seller_type),
                     high_bidder_slug = ?, winner_slug = ?,
                     n_bids = ?, bids_reported = ?, n_comments = ?,
                     fetched_at = ?,
@@ -355,7 +366,7 @@ class ActivityDB:
             """, (
                 detail.title,
                 detail.make, detail.model, detail.model_slug, detail.era, detail.origin, detail.category,
-                detail.chassis, detail.vin,
+                detail.chassis, detail.chassis_raw, detail.vin,
                 detail.country, detail.location,
                 detail.result,
                 detail.high_bid,
@@ -372,10 +383,18 @@ class ActivityDB:
             ))
 
             self.conn.execute("DELETE FROM bids WHERE listing_id = ?", (detail.listing_id,))
-            self.conn.executemany(
-                "INSERT OR REPLACE INTO bids (bid_id, listing_id, bidder_slug, amount, ts) VALUES (?, ?, ?, ?, ?)",
-                [(b.bid_id, detail.listing_id, b.bidder.slug, b.amount, b.ts) for b in detail.bids]
-            )
+            # a plain insert: a bid already stored under another listing is an error, never moved silently
+            for b in detail.bids:
+                try:
+                    self.conn.execute(
+                        "INSERT INTO bids (bid_id, listing_id, bidder_slug, amount, ts) VALUES (?, ?, ?, ?, ?)",
+                        (b.bid_id, detail.listing_id, b.bidder.slug, b.amount, b.ts)
+                    )
+                except sqlite3.IntegrityError as e:
+                    owner = self.conn.execute("SELECT listing_id FROM bids WHERE bid_id = ?", (b.bid_id,)).fetchone()
+                    if owner is None:
+                        raise
+                    raise ValueError(f"bid {b.bid_id} is already stored under listing {owner['listing_id']}") from e
 
             self.conn.execute("DELETE FROM listing_links WHERE listing_id = ?", (detail.listing_id,))
             self.conn.executemany("""
@@ -387,15 +406,16 @@ class ActivityDB:
             self.conn.execute("""
                 UPDATE listing_links SET related_listing_id = :id
                 WHERE related_listing_id IS NULL
-                  AND related_url IN (:url, (SELECT url FROM auctions WHERE listing_id = :id))
-            """, {'id': detail.listing_id, 'url': detail.url})
+                  AND related_url IN (:url, :requested, (SELECT url FROM auctions WHERE listing_id = :id))
+            """, {'id': detail.listing_id, 'url': detail.url, 'requested': requested_url or detail.url})
 
-    def mark_error(self, listing_id: int, error: str) -> None:
+    def mark_error(self, listing_id: int, error: str, count_attempt: bool = True) -> None:
+        """record why a fetch failed; count_attempt=False for failures that aren't the listing's fault"""
         with self.conn:
             self.conn.execute("""
-                UPDATE auctions SET fetch_attempts = fetch_attempts + 1, fetch_error = ?
+                UPDATE auctions SET fetch_attempts = fetch_attempts + ?, fetch_error = ?
                 WHERE listing_id = ?
-            """, (error[:500], listing_id))
+            """, (int(count_attempt), error[:500], listing_id))
 
     def reset_errors(self) -> dict:
         """make listings and history links that ran out of attempts eligible again"""
@@ -410,17 +430,17 @@ class ActivityDB:
             """).rowcount
         return {'listings': listings, 'links': links}
 
-    def mark_url_error(self, url: str, error: str) -> None:
+    def mark_url_error(self, url: str, error: str, count_attempt: bool = True) -> None:
         row = self.conn.execute("SELECT listing_id FROM auctions WHERE url = ?", (url,)).fetchone()
         if row:
-            self.mark_error(row['listing_id'], error)
+            self.mark_error(row['listing_id'], error, count_attempt)
             return
 
         with self.conn:
             self.conn.execute("""
-                UPDATE listing_links SET follow_attempts = follow_attempts + 1, follow_error = ?
+                UPDATE listing_links SET follow_attempts = follow_attempts + ?, follow_error = ?
                 WHERE related_url = ?
-            """, (error[:500], url))
+            """, (int(count_attempt), error[:500], url))
 
     def pending(
         self,
@@ -431,7 +451,7 @@ class ActivityDB:
     ) -> List[sqlite3.Row]:
         stale = " OR COALESCE(parser_version, 0) < ?" if upgrade_below else ""
         sql = f"""
-            SELECT listing_id, url FROM auctions
+            SELECT listing_id, url, end_ts FROM auctions
             WHERE fetch_attempts < ? AND (fetched_at IS NULL{stale})
         """
         params = [max_attempts] + ([upgrade_below] if upgrade_below else [])
@@ -446,7 +466,7 @@ class ActivityDB:
 
     def pending_history(self, max_attempts: int = 3) -> List[sqlite3.Row]:
         return self.conn.execute("""
-            SELECT NULL AS listing_id, related_url AS url
+            SELECT NULL AS listing_id, related_url AS url, MAX(related_end_ts) AS end_ts
             FROM listing_links
             WHERE related_listing_id IS NULL
             GROUP BY related_url

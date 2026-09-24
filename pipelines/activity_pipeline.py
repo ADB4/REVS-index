@@ -3,7 +3,9 @@ from datetime import datetime, timezone
 from typing import List, Optional
 
 from sites.bringatrailer.http_client import BaTClient, RateLimited, SiteUnavailable, challenge_marker
-from sites.bringatrailer.activity_parser import ActivityParser, ListingParseError, PARSER_VERSION, parse_results_page
+from sites.bringatrailer.activity_parser import (
+    ActivityParser, ListingParseError, NotFinal, PARSER_VERSION, parse_results_page
+)
 from storage.activity_db import ActivityDB
 
 
@@ -11,15 +13,22 @@ from storage.activity_db import ActivityDB
 # that won't parse; either way, stop instead of burning through the queue
 MAX_SITE_FAILURES_IN_A_ROW = 5
 MAX_FAILURES_IN_A_ROW = 20
+# the results feed only lists finished auctions, so finished ones without the ended marker mean
+# the marker was renamed, and the finality check would otherwise skip every page from here on
+MAX_UNMARKED_ENDED_IN_A_ROW = 5
 
 
 class CircuitOpen(Exception):
-    """a fetch run stopped early because too many listings failed in a row"""
+    """a fetch run stopped early; kind is 'site' (a block or outage), 'failures' (pages failing one after
+    another) or 'unmarked' (finished auctions whose pages don't say so)"""
 
-    def __init__(self, message: str, site_level: bool):
+    def __init__(self, message: str, kind: str):
         super().__init__(message)
-        # site-level failures don't use up attempts, so rerunning later picks up where this stopped
-        self.site_level = site_level
+        self.kind = kind
+
+
+class ListingMismatch(Exception):
+    """a queued url served a different listing"""
 
 
 def fmt_ts(ts: Optional[int]) -> str:
@@ -37,7 +46,8 @@ class ActivityPipeline:
         db: ActivityDB,
         activity_config: dict,
         max_site_failures: int = MAX_SITE_FAILURES_IN_A_ROW,
-        max_failures: int = MAX_FAILURES_IN_A_ROW
+        max_failures: int = MAX_FAILURES_IN_A_ROW,
+        max_unmarked_ended: int = MAX_UNMARKED_ENDED_IN_A_ROW
     ):
         self.client = client
         self.parser = parser
@@ -47,6 +57,7 @@ class ActivityPipeline:
         self.sort = activity_config['results_sort']
         self.max_site_failures = max_site_failures
         self.max_failures = max_failures
+        self.max_unmarked_ended = max_unmarked_ended
 
     def discover(
         self,
@@ -118,7 +129,7 @@ class ActivityPipeline:
         urls: Optional[List[str]] = None
     ) -> dict:
         if urls:
-            queue = [{'listing_id': None, 'url': url} for url in urls]
+            queue = [{'listing_id': None, 'url': url, 'end_ts': None} for url in urls]
         else:
             rows = self.db.pending(limit, since_ts, max_attempts, upgrade_below=PARSER_VERSION if upgrade else None)
             queue = [dict(r) for r in rows]
@@ -136,37 +147,42 @@ class ActivityPipeline:
 
         fetched = 0
         failed = 0
+        not_final = 0
         bids = 0
         followed = 0
         i = 0
         site_failures = 0
         failures = 0
+        unmarked_ended = 0
 
         try:
             while i < len(queue) and (not limit or i < limit):
                 row = queue[i]
                 i += 1
+                now = time.time()
 
                 try:
-                    detail = self._fetch_listing(row['url'])
+                    detail = self._fetch_listing(row['url'], now)
 
+                    # never file one listing's page under another listing's id
                     if row['listing_id'] and detail.listing_id != row['listing_id']:
-                        print(f"    listing id mismatch for {row['url']}: page says {detail.listing_id}")
-                        detail.listing_id = row['listing_id']
+                        raise ListingMismatch(f"url serves listing {detail.listing_id}, not {row['listing_id']}")
 
+                    for note in detail.notes:
+                        print(f"    {row['url']}: {note}")
                     if detail.bids_reported is not None and detail.bids_reported != len(detail.bids):
                         print(f"    bid count mismatch for {row['url']}: page says {detail.bids_reported}, parsed {len(detail.bids)}")
 
-                    self.db.save_detail(detail, int(time.time()), PARSER_VERSION)
+                    self.db.save_detail(detail, int(now), PARSER_VERSION, requested_url=row['url'])
                     fetched += 1
                     bids += len(detail.bids)
-                    site_failures = failures = 0
+                    site_failures = failures = unmarked_ended = 0
 
                     # earlier (or later) auctions of the same car, so its ownership chain is complete
                     if follow_history:
                         for link in detail.history:
                             if link.url not in queued and self.db.needs_fetch(link.url):
-                                queue.append({'listing_id': None, 'url': link.url})
+                                queue.append({'listing_id': None, 'url': link.url, 'end_ts': link.end_ts})
                                 queued.add(link.url)
                                 followed += 1
 
@@ -180,36 +196,65 @@ class ActivityPipeline:
                     failures += 1
                     print(f"    site unavailable at {row['url']}: {e}")
                     if site_failures >= self.max_site_failures:
-                        raise CircuitOpen(f"{site_failures} site-level failures in a row, last: {e}", site_level=True) from e
+                        raise CircuitOpen(f"{site_failures} site-level failures in a row, last: {e}", 'site') from e
                     if failures >= self.max_failures:
-                        raise CircuitOpen(f"{failures} failures in a row, last: {e}", site_level=False) from e
+                        raise CircuitOpen(f"{failures} failures in a row, last: {e}", 'failures') from e
+
+                # a live auction: nothing saved, no attempt used, its history links not followed yet
+                except NotFinal as e:
+                    not_final += 1
+                    print(f"    not over yet, nothing saved: {e}")
+                    ended_ts = row.get('end_ts') or e.end_ts
+                    if e.marker_missing and ended_ts and ended_ts < now:
+                        unmarked_ended += 1
+                        if unmarked_ended >= self.max_unmarked_ended:
+                            raise CircuitOpen(
+                                f"{unmarked_ended} auctions in a row that ended have no ended marker "
+                                f"({self.parser.selectors['ended_marker']}), last: {row['url']}", 'unmarked'
+                            ) from e
+
+                # the page came back but doesn't read like a finished listing: likely a markup change,
+                # so it's recorded without using up an attempt
+                except ListingParseError as e:
+                    failed += 1
+                    failures += 1
+                    self._record_failure(row, e, count_attempt=False)
+                    print(f"    failed {row['url']}: {e}")
+                    if failures >= self.max_failures:
+                        raise CircuitOpen(f"{failures} failures in a row, last: {e}", 'failures') from e
 
                 # keep a multi-day crawl alive through one bad page; ctrl-c still stops it
                 except Exception as e:
                     failed += 1
                     failures += 1
-                    if row['listing_id']:
-                        self.db.mark_error(row['listing_id'], str(e))
-                    else:
-                        self.db.mark_url_error(row['url'], str(e))
+                    self._record_failure(row, e, count_attempt=True)
                     print(f"    failed {row['url']}: {e}")
                     if failures >= self.max_failures:
-                        raise CircuitOpen(f"{failures} failures in a row, last: {e}", site_level=False) from e
+                        raise CircuitOpen(f"{failures} failures in a row, last: {e}", 'failures') from e
 
                 if i % 25 == 0 or i == len(queue):
-                    print(f"  fetched {i}/{len(queue)} ({bids} bids so far, {followed} history links followed, {failed} failed)")
+                    print(f"  fetched {i}/{len(queue)} ({bids} bids so far, {followed} history links followed, "
+                          f"{failed} failed, {not_final} not over yet)")
         finally:
             vehicles = self.db.rebuild_vehicles()
 
-        return {'fetched': fetched, 'failed': failed, 'bids': bids, 'followed': followed, 'vehicles': vehicles}
+        return {'fetched': fetched, 'failed': failed, 'not_final': not_final, 'bids': bids, 'followed': followed,
+                'vehicles': vehicles}
 
-    def _fetch_listing(self, url: str):
+    def _fetch_listing(self, url: str, now: float):
         page = self.client.get_page(url)
         try:
-            return self.parser.parse_listing(page.text, url)
+            # parsed against the url that answered, after any redirects
+            return self.parser.parse_listing(page.text, page.url, now=now)
         except ListingParseError:
             # a challenge or block page comes back as a 200 that just doesn't parse
             marker = challenge_marker(page.text)
             if marker:
                 raise SiteUnavailable(f"{url} served a challenge page ({marker!r})")
             raise
+
+    def _record_failure(self, row: dict, error: Exception, count_attempt: bool):
+        if row['listing_id']:
+            self.db.mark_error(row['listing_id'], str(error), count_attempt)
+        else:
+            self.db.mark_url_error(row['url'], str(error), count_attempt)

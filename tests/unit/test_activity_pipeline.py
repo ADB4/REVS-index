@@ -80,14 +80,14 @@ class TestFetchCircuitBreaker(unittest.TestCase):
 
     def test_site_level_failures_stop_after_five_without_charging_attempts(self):
         stats, client, stopped = self.fetch([SiteUnavailable('http 403 from x', 403)])
-        self.assertTrue(stopped.site_level)
+        self.assertEqual(stopped.kind, 'site')
         self.assertEqual(len(client.requests), 5)
         self.assertEqual(set(self.attempts()), {0})
         self.assertEqual(self.db.query("SELECT COUNT(*) AS n FROM auctions WHERE fetch_error IS NOT NULL")[0]['n'], 0)
 
     def test_challenge_page_is_site_level(self):
         stats, client, stopped = self.fetch([CHALLENGE.decode()])
-        self.assertTrue(stopped.site_level)
+        self.assertEqual(stopped.kind, 'site')
         self.assertIn('challenge', str(stopped))
         self.assertEqual((len(client.requests), set(self.attempts())), (5, {0}))
 
@@ -99,7 +99,7 @@ class TestFetchCircuitBreaker(unittest.TestCase):
 
     def test_listing_level_failures_are_charged_and_stop_after_twenty(self):
         stats, client, stopped = self.fetch([HTTPStatusError(404, 'x')])
-        self.assertFalse(stopped.site_level)
+        self.assertEqual(stopped.kind, 'failures')
         self.assertEqual(len(client.requests), 20)
         self.assertEqual(self.attempts(), [1] * 20 + [0] * 20)
 
@@ -109,6 +109,74 @@ class TestFetchCircuitBreaker(unittest.TestCase):
         with redirect_stdout(io.StringIO()), self.assertRaises(RateLimited):
             pipeline.fetch(follow_history=False)
         self.assertEqual((len(client.requests), set(self.attempts())), (1, {0}))
+
+
+class TestFetchSavesOnlyFinalData(unittest.TestCase):
+
+    def setUp(self):
+        self.db = ActivityDB(':memory:')
+        self.db.upsert_summaries(summaries('https://bringatrailer.com', 6), now=1)
+
+    def tearDown(self):
+        self.db.close()
+
+    def fetch(self, outcomes, **kwargs):
+        self.client = FakeClient(outcomes)
+        pipeline = ActivityPipeline(self.client, ActivityParser(SELECTORS), self.db, ACTIVITY_CONFIG)
+        with redirect_stdout(io.StringIO()):
+            try:
+                return pipeline.fetch(**kwargs)
+            except CircuitOpen as e:
+                return e
+
+    def row(self, listing_id):
+        return self.db.query("SELECT * FROM auctions WHERE listing_id = ?", (listing_id,))[0]
+
+    def test_a_url_serving_another_listing_is_an_error_not_a_save(self):
+        self.fetch([listing_html(listing_id=9999, history='')], limit=1)
+        row = self.row(5000)
+        self.assertEqual((row['fetched_at'], row['fetch_attempts']), (None, 1))
+        self.assertIn('serves listing 9999', row['fetch_error'])
+        self.assertEqual(self.db.query("SELECT COUNT(*) AS n FROM auctions WHERE listing_id = 9999")[0]['n'], 0)
+        self.assertEqual(self.db.query("SELECT COUNT(*) AS n FROM bids")[0]['n'], 0)
+
+    def test_a_live_page_is_skipped_until_it_ends(self):
+        live = lambda url: listing_html(listing_id=5000, ended=False, end_ts=None,
+                                        result_text='Current Bid: <strong>USD $6,000</strong>')
+        stats = self.fetch([live], limit=1)
+        row = self.row(5000)
+        self.assertEqual((stats['fetched'], stats['not_final'], stats['followed']), (0, 1, 0))
+        self.assertEqual((row['fetched_at'], row['fetch_attempts'], row['fetch_error']), (None, 0, None))
+        self.assertEqual(self.db.query("SELECT COUNT(*) AS n FROM listing_links")[0]['n'], 0)
+        self.assertEqual(self.client.requests, ['https://bringatrailer.com/listing/car-0/'])
+
+        stats = self.fetch([lambda url: listing_html(listing_id=5000)], limit=1)
+        self.assertEqual(stats['fetched'], 1)
+        self.assertIsNotNone(self.row(5000)['fetched_at'])
+
+    def test_a_renamed_ended_marker_stops_the_run(self):
+        renamed = lambda url: page_for(url).replace('listing-closed', 'listing-done').replace('listing-stats ended', 'listing-stats done')
+        stopped = self.fetch([renamed])
+        self.assertIsInstance(stopped, CircuitOpen)
+        self.assertEqual(stopped.kind, 'unmarked')
+        self.assertEqual(len(self.client.requests), 5)
+        self.assertEqual({(r['fetched_at'], r['fetch_attempts']) for r in self.db.query("SELECT * FROM auctions")}, {(None, 0)})
+
+    def test_layout_errors_are_recorded_without_using_attempts(self):
+        broken = lambda url: page_for(url).replace('listing-available-info', 'listing-info-v2')
+        stats = self.fetch([broken], limit=2)
+        self.assertEqual((stats['fetched'], stats['failed']), (0, 2))
+        rows = self.db.query("SELECT fetch_attempts, fetch_error FROM auctions WHERE fetch_error IS NOT NULL")
+        self.assertEqual([r['fetch_attempts'] for r in rows], [0, 0])
+        self.assertIn('has no result', rows[0]['fetch_error'])
+
+    def test_twenty_layout_errors_in_a_row_stop_the_run(self):
+        self.db.upsert_summaries(summaries('https://bringatrailer.com', 30), now=1)
+        broken = lambda url: page_for(url).replace('class="essentials"', 'class="essentials-v2"')
+        stopped = self.fetch([broken])
+        self.assertEqual(stopped.kind, 'failures')
+        self.assertEqual(len(self.client.requests), 20)
+        self.assertEqual({r['fetch_attempts'] for r in self.db.query("SELECT fetch_attempts FROM auctions")}, {0})
 
 
 class CliCase(unittest.TestCase):
@@ -212,6 +280,35 @@ class TestCliExitCodes(CliCase):
         self.assertEqual(status, 2)
         self.assertEqual(len(self.server.hits), 1)
         self.assertTrue(self.server.paths()[0].startswith('/wp-json/'))
+
+
+class TestCliRedirects(CliCase):
+
+    def test_history_link_that_redirects_is_saved_and_resolved(self):
+        base = self.server.base_url
+        old_url, new_url = f'{base}/listing/old-slug/', f'{base}/listing/new-slug/'
+        history = f'''<div class="history"><div class="items">
+            <a href="{old_url}" class="item"><div class="message"><em>Sold by x to y</em></div></a></div></div>'''
+        self.seed(1)
+        self.server.routes['/listing/car-0/'] = (200, {}, listing_html(listing_id=5000, history=history).encode())
+        self.server.routes['/listing/old-slug/'] = (301, {'Location': '/listing/new-slug/'}, b'')
+        self.server.routes['/listing/new-slug/'] = (200, {}, listing_html(listing_id=7000, history='').encode())
+
+        status, out = self.run_cli('fetch')
+        self.assertEqual(status, 0, out)
+        self.assertEqual(self.server.paths(), ['/listing/car-0/', '/listing/old-slug/', '/listing/new-slug/'])
+        db = ActivityDB(self.db_path)
+        try:
+            self.assertEqual(db.query("SELECT url FROM auctions WHERE listing_id = 7000")[0]['url'], new_url)
+            self.assertEqual(db.query("SELECT related_listing_id FROM listing_links")[0]['related_listing_id'], 7000)
+            self.assertEqual(db.pending_history(), [])
+        finally:
+            db.close()
+
+        # a second run has nothing left to follow
+        self.server.hits.clear()
+        status, out = self.run_cli('fetch')
+        self.assertEqual((status, self.server.hits), (0, []))
 
 
 class TestCliUrlAndReset(CliCase):

@@ -18,6 +18,15 @@ CONFIG_PATH = os.path.join(ROOT, 'config/sites/bringatrailer.yaml')
 DEFAULT_DB = os.path.join(ROOT, 'data/db/bat_activity.db')
 
 
+STOP_HINTS = {
+    'site': "no listing was charged an attempt for this; once the site answers normally, run the same command again",
+    'failures': "check the errors above. layout errors don't use up attempts, so a parser fix picks those listings up "
+                "again; http and redirect errors do, and `reset-errors` makes those eligible again",
+    'unmarked': "nothing was saved or charged for these. compare activity.selectors.ended_marker in "
+                "config/sites/bringatrailer.yaml with a finished listing's page",
+}
+
+
 def parse_date(value: str) -> int:
     return int(datetime.strptime(value, '%Y-%m-%d').replace(tzinfo=timezone.utc).timestamp())
 
@@ -527,10 +536,7 @@ def main(argv=None):
             status = 2
         except (SiteUnavailable, CircuitOpen) as e:
             print(f"\nstopped: {e}")
-            if getattr(e, 'site_level', True):
-                print("no listing was charged an attempt for this; once the site answers normally, run the same command again")
-            else:
-                print("check the errors above (a markup change?); after fixing, `reset-errors` makes these listings eligible again")
+            print(STOP_HINTS[getattr(e, 'kind', 'site')])
             status = 2
         print(f"{pipeline.client.request_count} request(s) made, database at {args.db}")
         return status

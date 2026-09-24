@@ -107,6 +107,39 @@ class TestActivityDB(unittest.TestCase):
         self.assertEqual((pairs[('dealer', 'bob')]['auctions_bid'], pairs[('dealer', 'bob')]['won']), (2, 1))
         self.assertEqual(pairs[('alice', 'bob')]['won'], 0)
 
+    def test_unknown_result_never_overwrites_a_known_one(self):
+        self.db.upsert_summaries([summary(1)], now=1)
+        self.db.save_detail(detail(1, 'dealer', [('alice', 1000)]), now=2, parser_version=PV)
+        self.db.save_detail(detail(1, 'dealer', [('alice', 1000)], result='unknown'), now=3, parser_version=PV)
+        self.assertEqual(self.db.query("SELECT result FROM auctions")[0]['result'], 'sold')
+
+    def test_fields_a_page_didnt_yield_keep_their_stored_values(self):
+        self.db.upsert_summaries([summary(1)], now=1)
+        self.db.save_detail(detail(1, 'dealer', [('alice', 1000)], vin='WBSBR934X2EX23144'), now=2, parser_version=PV)
+        blank = detail(1, 'dealer', [('alice', 1000)])
+        blank.seller = blank.make = blank.model_slug = blank.chassis = blank.vin = None
+        self.db.save_detail(blank, now=3, parser_version=PV)
+        row = self.db.query("SELECT seller_slug, make, model_slug, vin, fetched_at FROM auctions")[0]
+        self.assertEqual(tuple(row), ('dealer', 'BMW', 'bmw/model', 'WBSBR934X2EX23144', 3))
+
+    def test_a_bid_stored_under_another_listing_is_refused(self):
+        self.db.upsert_summaries([summary(1), summary(2)], now=1)
+        self.db.save_detail(detail(1, 'dealer', [('alice', 1000)]), now=2, parser_version=PV)
+        other = detail(2, 'dealer', [('bob', 2000)])
+        other.bids[0].bid_id = 100
+        with self.assertRaises(ValueError) as ctx:
+            self.db.save_detail(other, now=3, parser_version=PV)
+        self.assertIn('already stored under listing 1', str(ctx.exception))
+        rows = {r['listing_id']: r for r in self.db.query("SELECT listing_id, fetched_at FROM auctions")}
+        self.assertIsNone(rows[2]['fetched_at'])
+        self.assertEqual([tuple(r) for r in self.db.query("SELECT bid_id, listing_id FROM bids")], [(100, 1)])
+
+    def test_mark_error_can_record_without_using_an_attempt(self):
+        self.db.upsert_summaries([summary(1)], now=1)
+        self.db.mark_error(1, 'layout changed', count_attempt=False)
+        row = self.db.query("SELECT fetch_attempts, fetch_error FROM auctions")[0]
+        self.assertEqual(tuple(row), (0, 'layout changed'))
+
     def test_meta_roundtrip(self):
         self.assertIsNone(self.db.get_meta('backfill_next_page'))
         self.db.set_meta('backfill_next_page', '12')
@@ -170,11 +203,26 @@ class TestVehicleTracking(unittest.TestCase):
         self.assertFalse(self.db.needs_fetch(url(1)))
         self.assertEqual(self.vehicle_ids(), {1: 1, 2: 1})
 
+    def test_history_link_resolves_through_a_redirect(self):
+        # listing 2 links to an old url; fetching it redirected to the listing's current url
+        self.save(detail(2, 'b', [('c', 200)], history=['https://bringatrailer.com/listing/old-slug/']))
+        moved = detail(1, 'a', [('b', 100)])
+        self.db.save_detail(moved, now=1, parser_version=PV, requested_url='https://bringatrailer.com/listing/old-slug/')
+        self.assertEqual(self.db.pending_history(), [])
+        self.assertFalse(self.db.needs_fetch('https://bringatrailer.com/listing/old-slug/'))
+
     def test_failed_history_follows_stop_after_max_attempts(self):
         self.save(detail(2, 'b', [], history=[url(1)]))
         for _ in range(3):
             self.db.mark_url_error(url(1), 'http 404')
         self.assertEqual(self.db.pending_history(max_attempts=3), [])
+
+    def test_parts_listing_quoting_a_vin_doesnt_join_that_car(self):
+        self.save(
+            detail(1, 'a', [('b', 100)], vin=self.VIN),
+            detail(2, 'c', [('d', 50)], make='Parts and Automobilia', vin=self.VIN)
+        )
+        self.assertEqual(self.vehicle_ids(), {1: 1, 2: None})
 
     def test_listings_without_identity_are_not_vehicles(self):
         self.save(detail(1, 'a', [], make='Parts and Automobilia'))
@@ -237,7 +285,7 @@ class TestMigration(unittest.TestCase):
 
             db = ActivityDB(path)
             columns = {r['name'] for r in db.query("PRAGMA table_info(auctions)")}
-            self.assertTrue({'vin', 'chassis', 'vehicle_id', 'parser_version', 'bids_reported'} <= columns)
+            self.assertTrue({'vin', 'chassis', 'chassis_raw', 'vehicle_id', 'parser_version', 'bids_reported'} <= columns)
 
             view_columns = [d[0] for d in db.conn.execute("SELECT * FROM member_activity").description]
             self.assertIn('listed', view_columns)
