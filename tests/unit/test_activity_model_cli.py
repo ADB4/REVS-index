@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 
 from test_activity_parser import listing_html
 from test_activity_pipeline import CliCase
+import cli.commands.activity as cli
 from pipelines.activity_pipeline import ActivityPipeline
 from core.models.model_definition import ModelDefinition
 from storage.activity_db import ActivityDB
@@ -348,6 +349,15 @@ class TestModelCommand(ModelCliCase):
     def test_slug_or_json_is_required(self):
         with redirect_stdout(io.StringIO()), mock.patch('sys.stderr', io.StringIO()), self.assertRaises(SystemExit):
             self.run_cli('model')
+
+    def test_a_first_model_run_in_a_fresh_checkout(self):
+        self.add_car(0)
+        db_path = os.path.join(self.tmp.name, 'fresh', 'data', 'db', 'bat_activity.db')
+        out = io.StringIO()
+        with redirect_stdout(out):
+            status = cli.main(['--db', db_path, 'model', 'chevrolet/c8', '--no-report'])
+        self.assertEqual(status, 0, out.getvalue())
+        self.assertEqual(self.listing_paths(), ['/listing/car-0/'])
 
     def test_another_run_holding_the_database_exits_75(self):
         from cli.commands.activity import run_lock

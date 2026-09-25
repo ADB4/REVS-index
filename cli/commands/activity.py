@@ -128,6 +128,8 @@ def run_lock(db_path: str):
     if fcntl is None or db_path == ':memory:':
         yield
         return
+    # the lock sits next to the database, whose directory a first run hasn't made yet
+    os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
     lock_file = open(os.path.abspath(db_path) + '.lock', 'a')
     try:
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)

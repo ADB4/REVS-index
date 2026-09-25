@@ -275,6 +275,14 @@ class TestCliExitCodes(CliCase):
         self.assertEqual(status, 0, out)
         self.assertTrue(all(r['fetched_at'] for r in self.rows()))
 
+    def test_a_first_run_makes_the_databases_directory(self):
+        # the default is data/db/bat_activity.db, and data/db/ doesn't exist in a fresh checkout
+        db_path = os.path.join(self.tmp.name, 'data', 'db', 'bat_activity.db')
+        with redirect_stdout(io.StringIO()):
+            status = cli.main(['--db', db_path, 'fetch'])
+        self.assertEqual(status, 0)
+        self.assertTrue(os.path.exists(db_path))
+
     def test_ctrl_c_exits_130(self):
         self.seed(3)
         with mock.patch.object(ActivityPipeline, 'fetch', side_effect=KeyboardInterrupt):
