@@ -14,6 +14,7 @@ from extractors.field_extractors.transmission_extractor import TransmissionExtra
 from extractors.field_extractors.mileage_extractor import MileageExtractor
 from extractors.field_extractors.color_extractor import ColorExtractor
 from extractors.field_extractors.price_extractor import PriceExtractor
+from extractors.variant import extract_variant
 
 
 class BringATrailerSite(BaseSite):
@@ -350,44 +351,4 @@ class BringATrailerSite(BaseSite):
         return excerpt_paragraphs
     
     def _extract_variant(self, title: str, config: ScrapeConfig) -> str:
-        try:
-            title_upper = title.upper()
-            make_upper = config.make.upper()
-            model_short_upper = config.model_short.upper()
-            
-            make_index = title_upper.find(make_upper)
-            if make_index == -1:
-                return "Standard"
-            
-            after_make = title[make_index + len(config.make):].strip()
-            model_index = after_make.upper().find(model_short_upper)
-            
-            if model_index == -1:
-                return "Standard"
-            
-            after_model = after_make[model_index + len(config.model_short):].strip()
-            
-            if not after_model:
-                return "Standard"
-            
-            transmission_match = re.search(r'\d+-Speed', after_model, re.I)
-            if transmission_match:
-                variant_end = transmission_match.start()
-                variant = after_model[:variant_end].strip()
-            else:
-                variant = after_model.strip()
-            
-            if not variant:
-                return "Standard"
-            
-            variant_parts = variant.split()
-            if variant_parts:
-                first_word = variant_parts[0]
-                common_words = ['for', 'with', 'in', 'at', 'by', 'from', 'on', 'and', 'the']
-                if first_word.lower() in common_words:
-                    return "Standard"
-            
-            return variant
-            
-        except Exception as e:
-            return "Standard"
+        return extract_variant(title, config.make, config.model_short)

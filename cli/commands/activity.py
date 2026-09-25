@@ -28,6 +28,10 @@ from core.models.model_definition import ModelDefinition, load_model_file, norma
 from sites.bringatrailer.model_page import params_from_url
 from pipelines.activity_pipeline import ActivityPipeline, CircuitOpen, fmt_ts
 from pipelines.model_pipeline import ModelPipeline, ModelSetupError, page_scope
+from pipelines.model_prices import (
+    mileage_band, mileage_band_order, monthly, price_groups, sale_period, split_rows, summarize, is_usd_sale
+)
+from extractors.variant import extract_variant
 from pipelines.crawl_budget import CrawlBudget, parse_active_hours
 
 
@@ -392,7 +396,84 @@ def run_model(args, pipeline: ActivityPipeline, models, created=frozenset()) -> 
 
 def report_model(db: ActivityDB, args):
     """what a model's auctions sold for, then who sold, bid on and bought them"""
+    report_prices(db, args)
     report_leaderboards(db, args)
+    print()
+
+
+def miles(value) -> str:
+    return '-' if value is None else f"{value:,}"
+
+
+def report_prices(db: ActivityDB, args):
+    """sale prices of the scoped auctions (fetched, cars only, usd), overall and by period, model year,
+    transmission and mileage, then the latest sales"""
+    where, params = auction_filters(db, args, 'a')
+    rows = [dict(r) for r in db.query(f"""
+        SELECT a.listing_id, a.url, a.title, a.year, a.make, a.end_ts, a.result, a.high_bid, a.currency,
+               a.transmission, a.mileage, a.exterior_color, a.fetched_at,
+               s.display_name AS seller, w.display_name AS buyer
+        FROM auctions a
+        LEFT JOIN members s ON s.slug = a.seller_slug
+        LEFT JOIN members w ON w.slug = a.winner_slug
+        WHERE 1 = 1{where}
+    """, params)]
+    fetched = [r for r in rows if r['fetched_at']]
+    split = split_rows(fetched)
+    cars = split['cars']
+    total = summarize(cars)
+
+    print("=" * 70)
+    print(f"{scope_name(args)} prices{' since ' + fmt_ts(args.since) if args.since else ''}")
+    print("=" * 70)
+    print(f"  auctions      : {total['auctions']:,} fetched: {total['sold']:,} sold, "
+          f"{total['reserve_not_met']:,} reserve not met, {total['withdrawn']:,} withdrawn")
+    print(f"  sell-through  : {pct(total['sell_through'])} (sold, of those sold or bid to the reserve)")
+    # counted as sold above, but their prices can't be summed in dollars
+    unpriced = [f"{n:,} sale(s) {what}" for n, what in (
+        (split['other_currency'], 'in other currencies'), (split['no_price'], 'without a price')) if n]
+    print(f"  sale prices   : median {money(total['median'])}, low {money(total['low'])}, "
+          f"high {money(total['high'])} (USD{'; not counting ' + ' or '.join(unpriced) if unpriced else ''})")
+    left_out = [f"{n:,} {what}" for n, what in (
+        (split['parts'], 'parts listing(s)'),
+        (len(rows) - len(fetched), "of the model's auctions not fetched yet"),
+    ) if n]
+    if left_out:
+        print(f"  not counted   : {', '.join(left_out)}")
+    if not cars:
+        return
+
+    columns = [('sold', 'sold', text), ('sell_through', 'sell-thru', pct), ('median', 'median', money),
+               ('low', 'low', money), ('high', 'high', money)]
+    by_month = monthly(cars)
+    dated = [r for r in cars if r['end_ts']]
+    print_table(f"by {'month' if by_month else 'quarter'} of sale", price_groups(dated, lambda r: sale_period(r['end_ts'], by_month)),
+                [('group', 'month' if by_month else 'quarter', text)] + columns)
+    print_table("by model year", price_groups(cars, lambda r: str(r['year']) if r['year'] else 'unknown',
+                                              lambda g: (g == 'unknown', g)),
+                [('group', 'year', text)] + columns)
+    counts = {}
+    for r in cars:
+        counts[r['transmission'] or 'unknown'] = counts.get(r['transmission'] or 'unknown', 0) + 1
+    print_table("by transmission", price_groups(cars, lambda r: r['transmission'] or 'unknown',
+                                                lambda g: (g == 'unknown', -counts[g], g)),
+                [('group', 'transmission', truncate(40))] + columns)
+    print_table("by mileage", price_groups(cars, lambda r: mileage_band(r['mileage']), mileage_band_order),
+                [('group', 'miles', text)] + columns)
+
+    model_def = getattr(args, 'model_def', None)
+    recent = sorted((r for r in cars if is_usd_sale(r)), key=lambda r: r['end_ts'] or 0, reverse=True)[:args.top]
+    variant_columns = []
+    if model_def and model_def.make and model_def.model_short:
+        for r in recent:
+            r['variant'] = extract_variant(r['title'] or '', model_def.make, model_def.model_short)
+        variant_columns = [('variant', 'variant', truncate(24))]
+    title = "recent sales" if variant_columns else "recent sales (the variant needs the model's --make and --model-short)"
+    print_table(title, recent, [('end_ts', 'date', fmt_ts), ('year', 'year', text)] + variant_columns + [
+        ('mileage', 'miles', miles), ('transmission', 'transmission', truncate(28)),
+        ('exterior_color', 'exterior', truncate(24)), ('high_bid', 'price', money), ('seller', 'seller', text),
+        ('buyer', 'buyer', text), ('url', 'url', text)
+    ])
     print()
 
 
@@ -1032,7 +1113,7 @@ def run_command(args, parser: argparse.ArgumentParser, config: dict, urls) -> in
                 report_resales(db, args)
             elif args.pairs:
                 report_pairs(db, args)
-            elif args.model_def:
+            elif args.model:
                 report_model(db, args)
             else:
                 # the overview describes the whole database, so a filtered report leaves it out
