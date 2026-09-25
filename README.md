@@ -102,6 +102,8 @@ python3 cli/commands/activity.py fetch --daily-budget 10000 --active-hours 08:00
 
 `sync --all` works through the whole queue, like `fetch`. `--limit` counts bat history links too, and `--since` still follows them whatever their date. at ~4s a request the full archive (~270k requests) takes ~12–13 days non-stop, or ~27 days at 10k a day.
 
+**parts last.** the feed doesn't say what an auction is, so `discover` and `sync` also walk the parts and wheels feeds (`activity.parts_categories` in the yaml: `category[]=379` and `380`), to the same `--since`, at a request per 60 parts auctions. fetch then leaves those auctions till after all the cars, so a `--limit` or daily budget reaches every car first; `fetch --skip-parts` (or `sync --skip-parts`) leaves them for a later run instead. they're still worth fetching: bids on parts and memorabilia are part of a member's picture. an empty `parts_categories` turns this off.
+
 ```bash
 # reports: read-only, safe while a crawl runs
 python3 cli/commands/activity.py report                         # overview, top sellers, bidders, buyers
@@ -222,6 +224,7 @@ auctions sharing a 17-character vin, a chassis number within one make, or a bat 
 | `vehicle_timeline` | every auction of every car in order: transition, days since previous, price change |
 | `member_resales` | cars a member won and later resold: paid, resold for, days held |
 | `models` | models followed with `model`: slugs, make and names, year range, each model page's feed filter |
+| `feed_categories` | auctions the parts feeds listed, so fetch can leave them till last |
 | `model_listings` | the auctions each model's discovery turned up: `member`, `unchecked` (a title match to fetch), `other_model` or `out_of_years` |
 | `meta` | backfill cursors, discovery watermarks (site-wide and per model feed), budget settings and counts, schema version |
 

@@ -146,6 +146,13 @@ CREATE TABLE IF NOT EXISTS models (
     updated_at INTEGER
 );
 
+-- auctions a results-feed category (activity.parts_categories in the yaml) listed, so fetch can leave them till last
+CREATE TABLE IF NOT EXISTS feed_categories (
+    listing_id INTEGER NOT NULL REFERENCES auctions(listing_id),
+    category INTEGER NOT NULL,
+    PRIMARY KEY (listing_id, category)
+) WITHOUT ROWID;
+
 -- auctions a model's discovery turned up. status: 'member' (its model page's feed listed it, or its page's model
 -- tag matched), 'unchecked' (a title match not fetched yet), 'other_model' (a title match whose page is tagged as
 -- another model), 'out_of_years' (outside the model's year range, so never fetched for it)
@@ -178,8 +185,9 @@ ADDED_COLUMNS = [
     ('auctions', 'excerpt', 'TEXT'),
 ]
 
-# 2: auctions.url no longer UNIQUE; 3: participants table; 4: models and model_listings (created on open)
-SCHEMA_VERSION = 4
+# 2: auctions.url no longer UNIQUE; 3: participants table; 4: models and model_listings; 5: feed_categories
+# (4 and 5 only added tables, which TABLES creates on open)
+SCHEMA_VERSION = 5
 
 # fills participants for the listings a WHERE clause on bids picks
 PARTICIPANTS_INSERT = """
@@ -610,24 +618,37 @@ class ActivityDB:
         listing_ids: Optional[Iterable[int]] = None,
         now: Optional[float] = None,
         grace: int = REFETCH_GRACE,
-        fetched_only: bool = False
+        fetched_only: bool = False,
+        last_categories: Iterable[int] = (),
+        skip_categories: Iterable[int] = ()
     ) -> List[sqlite3.Row]:
         """listings to fetch: never fetched, flagged for a re-fetch, possibly saved before they were final,
         reserve-not-met ones whose deal window has passed, and (with upgrade_below) older parser versions.
-        fetched_only leaves out the never-fetched backlog"""
-        where, params = self._pending_where(since_ts, max_attempts, upgrade_below, listing_ids, now, grace, fetched_only)
-        sql = f"SELECT listing_id, url, end_ts FROM auctions WHERE {where} ORDER BY fetched_at IS NOT NULL, end_ts DESC"
+        fetched_only leaves out the never-fetched backlog. auctions a feed category in last_categories listed come
+        after all the rest; those in skip_categories are left out"""
+        where, params = self._pending_where(since_ts, max_attempts, upgrade_below, listing_ids, now, grace, fetched_only,
+                                            skip_categories)
+        params['last'] = json.dumps(list(last_categories))
+        sql = f"""
+            SELECT listing_id, url, end_ts FROM auctions WHERE {where}
+            ORDER BY listing_id IN (SELECT listing_id FROM feed_categories
+                                    WHERE category IN (SELECT value FROM json_each(:last))),
+                     fetched_at IS NOT NULL, end_ts DESC
+        """
         if limit is not None:
             sql += " LIMIT :limit"
             params['limit'] = limit
         return self.conn.execute(sql, params).fetchall()
 
     def pending_count(self, since_ts: Optional[int] = None, max_attempts: int = 3, upgrade_below: Optional[int] = None,
-                      listing_ids: Optional[Iterable[int]] = None, fetched_only: bool = False) -> int:
-        where, params = self._pending_where(since_ts, max_attempts, upgrade_below, listing_ids, None, REFETCH_GRACE, fetched_only)
+                      listing_ids: Optional[Iterable[int]] = None, fetched_only: bool = False,
+                      skip_categories: Iterable[int] = ()) -> int:
+        where, params = self._pending_where(since_ts, max_attempts, upgrade_below, listing_ids, None, REFETCH_GRACE,
+                                            fetched_only, skip_categories)
         return self.conn.execute(f"SELECT COUNT(*) FROM auctions WHERE {where}", params).fetchone()[0]
 
-    def _pending_where(self, since_ts, max_attempts, upgrade_below, listing_ids, now, grace, fetched_only):
+    def _pending_where(self, since_ts, max_attempts, upgrade_below, listing_ids, now, grace, fetched_only,
+                       skip_categories=()):
         stale = " OR COALESCE(parser_version, 0) < :upgrade" if upgrade_below else ""
         where = f"""
             fetch_attempts < :max_attempts AND (
@@ -648,6 +669,11 @@ class ActivityDB:
         if listing_ids is not None:
             where += " AND listing_id IN (SELECT value FROM json_each(:ids))"
             params['ids'] = json.dumps(list(listing_ids))
+        skip = list(skip_categories)
+        if skip:
+            where += (" AND listing_id NOT IN (SELECT listing_id FROM feed_categories "
+                      "WHERE category IN (SELECT value FROM json_each(:skip)))")
+            params['skip'] = json.dumps(skip)
         return where, params
 
     def pending_history(self, max_attempts: int = 3, from_ids: Optional[Iterable[int]] = None) -> List[sqlite3.Row]:
@@ -841,6 +867,15 @@ class ActivityDB:
                 int(time.time() if now is None else now)
             ))
 
+    def record_feed_category(self, category: int, listing_ids: Iterable[int]) -> None:
+        """auctions a results-feed category listed; one discovery couldn't store is skipped"""
+        with self.conn:
+            self.conn.executemany("""
+                INSERT INTO feed_categories (listing_id, category)
+                SELECT ?, ? WHERE EXISTS (SELECT 1 FROM auctions WHERE listing_id = ?)
+                ON CONFLICT(listing_id, category) DO NOTHING
+            """, [(listing_id, category, listing_id) for listing_id in listing_ids])
+
     def delete_model(self, key: str) -> bool:
         """forget a model nothing was recorded for, e.g. one whose slug turned out wrong; False if it has auctions"""
         with self.conn:
@@ -1000,7 +1035,7 @@ class ActivityDB:
             self._rebuild_auctions()
         if version < 3:
             self.rebuild_participants()
-        # 4 only added tables, which TABLES creates
+        # 4 and 5 only added tables, which TABLES creates
         if version < SCHEMA_VERSION:
             self.set_meta('schema_version', str(SCHEMA_VERSION))
 

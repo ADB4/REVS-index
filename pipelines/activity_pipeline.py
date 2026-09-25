@@ -77,6 +77,8 @@ class ActivityPipeline:
         self.max_site_failures = max_site_failures
         self.max_failures = max_failures
         self.max_unmarked_ended = max_unmarked_ended
+        # results-feed categories whose auctions are fetched last (or not at all, with skip_parts)
+        self.parts_categories = {int(k): v for k, v in (activity_config.get('parts_categories') or {}).items()}
 
     def discover(
         self,
@@ -260,6 +262,24 @@ class ActivityPipeline:
             'seen_ids': seen_ids, 'complete': older and newer
         }
 
+    def discover_parts(self, since_ts: Optional[int] = None, max_pages: Optional[int] = None) -> dict:
+        """walk each parts category's feed (category[]=<id>) back to since_ts, recording which auctions it lists so
+        fetch can leave them till last. each feed keeps its own cursor and watermark, so after its first walk only
+        what's new is read: about one request per 60 parts auctions in all"""
+        totals = {'pages': 0, 'seen': 0, 'new': 0, 'complete': True}
+        for category, name in self.parts_categories.items():
+            print(f"  {name} (category {category})")
+
+            def record(summaries: List[AuctionSummary], category=category):
+                self.db.record_feed_category(category, [s.listing_id for s in summaries])
+
+            stats = self.discover_feed(since_ts=since_ts, max_pages=max_pages, params={'category[]': [category]},
+                                       scope=f"category:{category}:", on_page=record)
+            for key in ('pages', 'seen', 'new'):
+                totals[key] += stats[key]
+            totals['complete'] = totals['complete'] and stats['complete']
+        return totals
+
     def fetch(
         self,
         limit: Optional[int] = None,
@@ -270,13 +290,17 @@ class ActivityPipeline:
         urls: Optional[List[str]] = None,
         listing_ids: Optional[List[int]] = None,
         due_refetches: bool = False,
-        history_from: Optional[List[int]] = None
+        history_from: Optional[List[int]] = None,
+        skip_parts: bool = False
     ) -> dict:
         """listing_ids limits the queue to those listings (what a sync just discovered, or a scoped re-fetch), and
         due_refetches adds already-fetched listings whose re-fetch is due. links found on fetched pages are always
         followed, straight after the page that listed them, and count against limit like any other fetch; with
-        listing_ids, history_from also picks up links an earlier run found on these listings but didn't follow"""
+        listing_ids, history_from also picks up links an earlier run found on these listings but didn't follow.
+        auctions the parts feeds listed come after everything else, or with skip_parts wait for another run"""
         upgrade_below = PARSER_VERSION if upgrade else None
+        last = list(self.parts_categories)
+        skip = last if skip_parts else []
         if urls:
             queue = [{'listing_id': None, 'url': url, 'end_ts': None, 'source': 'url'} for url in urls]
             waiting = None
@@ -291,12 +315,19 @@ class ActivityPipeline:
             # a sync's queue is bounded by what its discovery saw, so it's read whole and counted exactly;
             # the full backlog is only counted
             whole = limit is None or due_refetches
-            rows = list(self.db.pending(None if whole else limit, since_ts, max_attempts, upgrade_below, listing_ids))
+            rows = list(self.db.pending(None if whole else limit, since_ts, max_attempts, upgrade_below, listing_ids,
+                                        last_categories=last, skip_categories=skip))
             if due_refetches:
-                rows += self.db.pending(None, since_ts, max_attempts, fetched_only=True)
+                rows += self.db.pending(None, since_ts, max_attempts, fetched_only=True, last_categories=last,
+                                        skip_categories=skip)
             queue = [dict(r, source='history') for r in history] + [dict(r, source='queue') for r in rows]
             waiting = None if whole else len(history) + self.db.pending_count(since_ts, max_attempts, upgrade_below,
-                                                                                listing_ids)
+                                                                                listing_ids, skip_categories=skip)
+            if skip:
+                left = (self.db.pending_count(since_ts, max_attempts, upgrade_below, listing_ids)
+                        - self.db.pending_count(since_ts, max_attempts, upgrade_below, listing_ids, skip_categories=skip))
+                if left:
+                    print(f"  {left} parts auction(s) left for a run without --skip-parts")
 
         queued = set()
         unique = []

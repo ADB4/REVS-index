@@ -242,6 +242,11 @@ def run_discover(args, pipeline: ActivityPipeline) -> dict:
         backfill=args.backfill
     )
     print(f"\n{stats['pages']} page(s), {stats['seen']} auctions seen, {stats['new']} new\n")
+    if pipeline.parts_categories:
+        print("walking the parts feeds, so fetch can leave those auctions till last...")
+        print("=" * 70)
+        parts = pipeline.discover_parts(since_ts=args.since, max_pages=args.max_pages)
+        print(f"\n{parts['pages']} page(s), {parts['seen']} parts auctions seen, {parts['new']} new\n")
     return stats
 
 
@@ -256,7 +261,8 @@ def run_fetch(args, pipeline: ActivityPipeline, urls=None, listing_ids=None, due
         follow_history=not args.no_follow_history,
         urls=urls,
         listing_ids=listing_ids,
-        due_refetches=due_refetches
+        due_refetches=due_refetches,
+        skip_parts=getattr(args, 'skip_parts', False)
     )
     print(f"\n{stats['fetched']} auction(s) saved, {stats['bids']} bids, "
           f"{stats['followed']} history links followed, {stats['failed']} failed")
@@ -698,6 +704,15 @@ def report_overview(db: ActivityDB, raw_path=None):
     print(f"  bids                : {counts['bids']:,}")
     print(f"  vehicles tracked    : {vehicles['vehicles'] or 0:,} ({vehicles['repeat_vehicles'] or 0:,} auctioned more than once)")
 
+    parts = db.query("""
+        SELECT COUNT(DISTINCT f.listing_id) AS known,
+               COUNT(DISTINCT CASE WHEN a.fetched_at IS NOT NULL THEN f.listing_id END) AS fetched
+        FROM feed_categories f JOIN auctions a ON a.listing_id = f.listing_id
+    """)[0]
+    if parts['known']:
+        print(f"  parts auctions      : {parts['known']:,} known from the parts feeds, {parts['fetched']:,} fetched "
+              f"(fetch leaves the rest till last)")
+
     # rows discovery stored carry its no_reserve flag; history-followed ones don't until the feed lists them
     feed_total = db.get_meta('feed_items_total')
     if feed_total:
@@ -1030,7 +1045,8 @@ def report_member(db: ActivityDB, args):
 
 
 def add_discover_args(p):
-    p.add_argument('--max-pages', type=positive_int, help='stop after this many results pages')
+    p.add_argument('--max-pages', type=positive_int,
+                   help='stop after this many results pages (the site-wide feed, then each parts feed)')
     p.add_argument('--start-page', type=positive_int, help='results page to start from')
     p.add_argument('--reset-backfill-cursor', action='store_true', help='start the backfill over from page 1')
     p.add_argument('--backfill', action='store_true',
@@ -1098,6 +1114,10 @@ def main(argv=None):
     add_fetch_args(model)
     model.add_argument('--no-report', action='store_true', help="don't print the model's report at the end")
     model.add_argument('--top', type=positive_int, default=15, help='rows per report table')
+
+    for p in (fetch, sync):
+        p.add_argument('--skip-parts', action='store_true',
+                       help='leave auctions the parts feeds listed (activity.parts_categories) for a later run')
 
     for p in (discover, fetch, sync, model):
         p.add_argument('--since', type=date_arg,
