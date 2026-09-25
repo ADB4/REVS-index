@@ -123,6 +123,19 @@ def member_from_comment(comment: dict) -> Optional[Member]:
     return None
 
 
+def extract_js_object(html: str, var_name: str) -> Optional[dict]:
+    """the json a page's script assigns to var_name ("var BAT_VMS = {...};"), or None"""
+    marker = f"var {var_name} = "
+    start = html.find(marker)
+    if start == -1:
+        return None
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(html, start + len(marker))
+    except json.JSONDecodeError:
+        return None
+    return obj
+
+
 def parse_results_page(data: dict) -> List[AuctionSummary]:
     summaries = []
     for item in data.get('items', []):
@@ -257,15 +270,7 @@ class ActivityParser:
         return url
 
     def _extract_js_object(self, html: str, var_name: str) -> Optional[dict]:
-        marker = f"var {var_name} = "
-        start = html.find(marker)
-        if start == -1:
-            return None
-        try:
-            obj, _ = json.JSONDecoder().raw_decode(html, start + len(marker))
-        except json.JSONDecodeError:
-            return None
-        return obj
+        return extract_js_object(html, var_name)
 
     def _extract_listing_id(self, soup: BeautifulSoup, vms: dict) -> Optional[int]:
         elem = soup.select_one(self.selectors['listing_id'])
