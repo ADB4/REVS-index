@@ -21,15 +21,26 @@ from sites.bringatrailer.http_client import (
     BaTClient, DEFAULT_USER_AGENT, ROBOTS_TOKEN, RateLimited, SiteUnavailable, listing_url
 )
 from sites.bringatrailer.activity_parser import ActivityParser, PARSER_VERSION
+from sites.bringatrailer.listing_specs import ListingSpecs
 from storage.activity_db import ActivityDB
 from storage.raw_store import RawStore, raw_db_path
+from core.models.model_definition import ModelDefinition, load_model_file, normalize_slug, same_slug
+from sites.bringatrailer.model_page import params_from_url
 from pipelines.activity_pipeline import ActivityPipeline, CircuitOpen, fmt_ts
+from pipelines.model_pipeline import ModelPipeline, ModelSetupError, page_scope
+from pipelines.model_prices import (
+    mileage_band, mileage_band_order, monthly, price_groups, sale_period, split_rows, summarize, is_usd_sale
+)
+from extractors.variant import extract_variant
+from pipelines.model_export import OLD_FILTERS, export_rows, write_csv, write_json
 from pipelines.crawl_budget import CrawlBudget, parse_active_hours
 
 
 ROOT = os.path.join(os.path.dirname(__file__), '../..')
 CONFIG_PATH = os.path.join(ROOT, 'config/sites/bringatrailer.yaml')
 DEFAULT_DB = os.path.join(ROOT, 'data/db/bat_activity.db')
+# where the selenium scraper wrote <slug>_data.json, which normalize, ingest and the llm step read
+EXPORT_DIR = os.path.join(ROOT, 'data/json/output/raw')
 
 
 STOP_HINTS = {
@@ -49,7 +60,7 @@ EXIT_LOCKED = 75        # another run holds the database (EX_TEMPFAIL): try agai
 EXIT_INTERRUPTED = 130
 
 # commands that write to the database take its lock; report only reads
-LOCKED_COMMANDS = ('discover', 'fetch', 'sync', 'link', 'reparse', 'reset-errors')
+LOCKED_COMMANDS = ('discover', 'fetch', 'sync', 'model', 'link', 'reparse', 'reset-errors')
 
 # fetch --recheck-mismatches: saved listings whose page counted a different number of bids than were parsed
 MISMATCH_WHERE = "fetched_at IS NOT NULL AND bids_reported IS NOT NULL AND bids_reported != n_bids"
@@ -117,6 +128,8 @@ def run_lock(db_path: str):
     if fcntl is None or db_path == ':memory:':
         yield
         return
+    # the lock sits next to the database, whose directory a first run hasn't made yet
+    os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
     lock_file = open(os.path.abspath(db_path) + '.lock', 'a')
     try:
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -179,7 +192,7 @@ def build_pipeline(args, db: ActivityDB, config: dict, raw_store: RawStore) -> A
             long_pause_every=tuple(http['long_pause_every']) if http.get('long_pause_every') else None,
             long_pause_seconds=tuple(http['long_pause_seconds']) if http.get('long_pause_seconds') else None
         )
-    parser = ActivityParser(config['activity']['selectors'])
+    parser = ActivityParser(config['activity']['selectors'], ListingSpecs(config))
     return ActivityPipeline(client, parser, db, config['activity'], raw_store=raw_store)
 
 
@@ -229,6 +242,11 @@ def run_discover(args, pipeline: ActivityPipeline) -> dict:
         backfill=args.backfill
     )
     print(f"\n{stats['pages']} page(s), {stats['seen']} auctions seen, {stats['new']} new\n")
+    if pipeline.parts_categories:
+        print("walking the parts feeds, so fetch can leave those auctions till last...")
+        print("=" * 70)
+        parts = pipeline.discover_parts(since_ts=args.since, max_pages=args.max_pages)
+        print(f"\n{parts['pages']} page(s), {parts['seen']} parts auctions seen, {parts['new']} new\n")
     return stats
 
 
@@ -243,12 +261,302 @@ def run_fetch(args, pipeline: ActivityPipeline, urls=None, listing_ids=None, due
         follow_history=not args.no_follow_history,
         urls=urls,
         listing_ids=listing_ids,
-        due_refetches=due_refetches
+        due_refetches=due_refetches,
+        skip_parts=getattr(args, 'skip_parts', False)
     )
     print(f"\n{stats['fetched']} auction(s) saved, {stats['bids']} bids, "
           f"{stats['followed']} history links followed, {stats['failed']} failed")
     print_vehicle_stats(stats['vehicles'])
     return stats
+
+
+class ModelRefError(Exception):
+    """a model reference that names several followed models, or can't be used as given"""
+
+
+def model_definitions(args, db: ActivityDB, parser: argparse.ArgumentParser):
+    """the models a `model` run follows, and the keys of those this run added: the --json file's entries, or the slug
+    given, each matched to a followed model by its key or either spelling of a slug. a followed model keeps its feed
+    filter and tags; --make etc. and the file's names and years update it"""
+    created = set()
+    if args.json:
+        try:
+            entries = load_model_file(args.json)
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            parser.error(f"--json: {e}")
+        models = []
+        for entry in entries:
+            stored = {m.key: m for slug in entry.slugs for m in db.find_models(slug)}
+            if len(stored) > 1:
+                raise ModelRefError(f"--json entry {entry.key} names {len(stored)} followed models "
+                                    f"({', '.join(sorted(stored))}); give it one model's slugs")
+            if stored:
+                known = next(iter(stored.values()))
+                entry.key, entry.filters, entry.tag_slugs = known.key, known.filters, known.tag_slugs
+                entry.slugs = list(dict.fromkeys(known.slugs + entry.slugs))
+            else:
+                created.add(entry.key)
+            models.append(entry)
+    else:
+        slug = normalize_slug(args.slug)
+        if not slug:
+            parser.error(f"{args.slug!r} is not a model slug")
+        matches = db.find_models(slug)
+        if len(matches) > 1:
+            raise ModelRefError(f"{args.slug!r} names {len(matches)} followed models "
+                                f"({', '.join(m.key for m in matches)}); give one of those keys")
+        if matches:
+            model = matches[0]
+            # one that never got a feed may just have had the wrong spelling: this one's page is tried too
+            if not model.filters and slug not in model.slugs:
+                model.slugs.append(slug)
+        else:
+            model = ModelDefinition(key=slug, slugs=[slug])
+            created.add(slug)
+        models = [model]
+
+    for model in models:
+        for attr in ('make', 'model_full', 'model_short', 'min_year', 'max_year'):
+            if getattr(args, attr) is not None:
+                setattr(model, attr, getattr(args, attr))
+    if args.filter_url:
+        model = models[0]
+        target = next((s for s in model.slugs if args.slug and same_slug(s, args.slug)), None)
+        if len(models) != 1 or (target is None and len(model.slugs) > 1):
+            raise ModelRefError("--filter-url needs one model page: give its slug rather than --json or a model key")
+        target = target or model.slugs[0]
+        try:
+            model.filters[target] = params_from_url(args.filter_url)
+        except ValueError as e:
+            parser.error(f"--filter-url: {e}")
+        # kept until --refresh-filter, not replaced by the page's own a week later
+        db.set_meta(page_scope(model, target) + 'manual', '1')
+    for model in models:
+        db.save_model(model)
+        # a changed year range re-sorts the auctions already recorded for the model
+        db.apply_year_range(model)
+    return models, created
+
+
+def run_model(args, pipeline: ActivityPipeline, models, created=frozenset()) -> int:
+    """each model in turn: its auctions from its model page's feed (or titles), then their bid histories and
+    bat history links, then its report. --limit is the whole run's budget of listing pages. a model this run
+    added and found nothing for isn't kept"""
+    db = pipeline.db
+    discovery = ModelPipeline(pipeline, pipeline.client.base_url)
+    remaining = args.limit
+    status = 0
+    fetched = failed = 0
+    for n, model in enumerate(models, 1):
+        names = ' '.join(x for x in (model.make, model.model_full) if x)
+        print("=" * 70)
+        print(f"[{n}/{len(models)}] {model.key}{f'  ({names})' if names else ''}")
+        print("=" * 70)
+        print("discovering the model's auctions...")
+        try:
+            found = discovery.discover(model, since_ts=args.since, max_pages=args.max_pages,
+                                       refresh_filter=args.refresh_filter)
+        except ModelSetupError as e:
+            print(f"  {e}")
+            if model.key in created and db.delete_model(model.key):
+                print(f"  {model.key} isn't kept as a followed model")
+            print()
+            status = 1
+            continue
+        print(f"\n{found['pages']} page(s), {found['seen']} auctions seen, {found['new']} new\n")
+
+        ids = db.model_listing_ids(model)
+        if remaining is not None and remaining <= 0:
+            print("the --limit budget is spent; the next run fetches the rest\n")
+        else:
+            print("fetching bid histories...")
+            print("=" * 70)
+            stats = pipeline.fetch(limit=remaining, since_ts=args.since, max_attempts=args.max_attempts,
+                                   upgrade=args.upgrade, follow_history=not args.no_follow_history,
+                                   listing_ids=ids, history_from=ids)
+            print(f"\n{stats['fetched']} auction(s) saved, {stats['bids']} bids, "
+                  f"{stats['followed']} history links followed, {stats['failed']} failed")
+            print_vehicle_stats(stats['vehicles'])
+            if remaining is not None:
+                remaining -= stats['fetched'] + stats['failed'] + stats['not_final']
+            fetched += stats['fetched']
+            failed += stats['failed']
+        if not args.upgrade:
+            older = db.query(f"""
+                SELECT COUNT(*) AS n FROM auctions WHERE fetched_at IS NOT NULL AND COALESCE(parser_version, 0) < ?
+                  AND listing_id IN (SELECT value FROM json_each(?))
+            """, (PARSER_VERSION, json.dumps(ids)))[0]['n']
+            if older:
+                print(f"{older:,} of the model's auctions were saved by an older parser, without engine, mileage and "
+                      f"the like; --upgrade fetches them again\n")
+
+        checked = db.classify_model_candidates(model)
+        if checked['member'] or checked['other_model']:
+            print(f"title matches checked: {checked['member']} are the model, {checked['other_model']} another model's")
+            if checked['other_tags']:
+                tags = ', '.join(f"{tag} ({n})" for tag, n in checked['other_tags'].most_common(8))
+                print(f"  ruled out, tagged as: {tags}; if any of these are the model, add them to its slugs")
+            print()
+        if not args.no_report:
+            report_model(db, argparse.Namespace(model=model.key, model_def=model, since=args.since, top=args.top))
+    # as for fetch and sync: the whole run fetched nothing, and something failed
+    if fetched == 0 and failed > 0:
+        status = 1
+    return status
+
+
+def report_model(db: ActivityDB, args):
+    """what a model's auctions sold for, then who sold, bid on and bought them"""
+    report_prices(db, args)
+    report_leaderboards(db, args)
+    print()
+
+
+def miles(value) -> str:
+    return '-' if value is None else f"{value:,}"
+
+
+def report_prices(db: ActivityDB, args):
+    """sale prices of the scoped auctions (fetched, cars only, usd), overall and by period, model year,
+    transmission and mileage, then the latest sales"""
+    where, params = auction_filters(db, args, 'a')
+    rows = [dict(r) for r in db.query(f"""
+        SELECT a.listing_id, a.url, a.title, a.year, a.make, a.end_ts, a.result, a.high_bid, a.currency,
+               a.transmission, a.mileage, a.exterior_color, a.fetched_at,
+               s.display_name AS seller, w.display_name AS buyer
+        FROM auctions a
+        LEFT JOIN members s ON s.slug = a.seller_slug
+        LEFT JOIN members w ON w.slug = a.winner_slug
+        WHERE 1 = 1{where}
+    """, params)]
+    fetched = [r for r in rows if r['fetched_at']]
+    split = split_rows(fetched)
+    cars = split['cars']
+    total = summarize(cars)
+
+    print("=" * 70)
+    print(f"{scope_name(args)} prices{' since ' + fmt_ts(args.since) if args.since else ''}")
+    print("=" * 70)
+    print(f"  auctions      : {total['auctions']:,} fetched: {total['sold']:,} sold, "
+          f"{total['reserve_not_met']:,} reserve not met, {total['withdrawn']:,} withdrawn")
+    print(f"  sell-through  : {pct(total['sell_through'])} (sold, of those sold or bid to the reserve)")
+    # counted as sold above, but their prices can't be summed in dollars
+    unpriced = [f"{n:,} sale(s) {what}" for n, what in (
+        (split['other_currency'], 'in other currencies'), (split['no_price'], 'without a price')) if n]
+    print(f"  sale prices   : median {money(total['median'])}, low {money(total['low'])}, "
+          f"high {money(total['high'])} (USD{'; not counting ' + ' or '.join(unpriced) if unpriced else ''})")
+    left_out = [f"{n:,} {what}" for n, what in (
+        (split['parts'], 'parts listing(s)'),
+        (len(rows) - len(fetched), "of the model's auctions not fetched yet"),
+    ) if n]
+    if left_out:
+        print(f"  not counted   : {', '.join(left_out)}")
+    if not cars:
+        return
+
+    columns = [('sold', 'sold', text), ('sell_through', 'sell-thru', pct), ('median', 'median', money),
+               ('low', 'low', money), ('high', 'high', money)]
+    by_month = monthly(cars)
+    dated = [r for r in cars if r['end_ts']]
+    print_table(f"by {'month' if by_month else 'quarter'} of sale", price_groups(dated, lambda r: sale_period(r['end_ts'], by_month)),
+                [('group', 'month' if by_month else 'quarter', text)] + columns)
+    print_table("by model year", price_groups(cars, lambda r: str(r['year']) if r['year'] else 'unknown',
+                                              lambda g: (g == 'unknown', g)),
+                [('group', 'year', text)] + columns)
+    counts = {}
+    for r in cars:
+        counts[r['transmission'] or 'unknown'] = counts.get(r['transmission'] or 'unknown', 0) + 1
+    print_table("by transmission", price_groups(cars, lambda r: r['transmission'] or 'unknown',
+                                                lambda g: (g == 'unknown', -counts[g], g)),
+                [('group', 'transmission', truncate(40))] + columns)
+    print_table("by mileage", price_groups(cars, lambda r: mileage_band(r['mileage']), mileage_band_order),
+                [('group', 'miles', text)] + columns)
+
+    model_def = getattr(args, 'model_def', None)
+    recent = sorted((r for r in cars if is_usd_sale(r)), key=lambda r: r['end_ts'] or 0, reverse=True)[:args.top]
+    variant_columns = []
+    if model_def and model_def.make and model_def.model_short:
+        for r in recent:
+            r['variant'] = extract_variant(r['title'] or '', model_def.make, model_def.model_short)
+        variant_columns = [('variant', 'variant', truncate(24))]
+    title = "recent sales" if variant_columns else "recent sales (the variant needs the model's --make and --model-short)"
+    print_table(title, recent, [('end_ts', 'date', fmt_ts), ('year', 'year', text)] + variant_columns + [
+        ('mileage', 'miles', miles), ('transmission', 'transmission', truncate(28)),
+        ('exterior_color', 'exterior', truncate(24)), ('high_bid', 'price', money), ('seller', 'seller', text),
+        ('buyer', 'buyer', text), ('url', 'url', text)
+    ])
+    print()
+
+
+def resolve_model(db: ActivityDB, ref: str):
+    """the followed model a --model names, None for a slug that isn't followed; ValueError if it names several"""
+    matches = db.find_models(ref)
+    if len(matches) > 1:
+        raise ValueError(f"--model {ref} names {len(matches)} followed models: {', '.join(m.key for m in matches)}; "
+                         "give one of those keys")
+    return matches[0] if matches else None
+
+
+EXPORT_SKIPS = {
+    'non_usa': 'outside the USA', 'modified': "with 'modified' in the title", 'no_vin': 'without a 17-character vin', 'parts': 'parts listings', 'withdrawn': 'withdrawn',
+}
+
+
+def run_export(db: ActivityDB, args, config: dict) -> int:
+    """a model's fetched auctions as the selenium scraper's <slug>_data.json, which normalize, ingest and the llm
+    step read. by default it leaves out what that scraper left out; --all and the --include-* flags keep them"""
+    try:
+        model_def = resolve_model(db, args.model)
+    except ValueError as e:
+        print(e)
+        return 1
+    if not model_def:
+        print(f"{args.model} isn't a followed model, so its auctions are picked by their model tags, and make and "
+              f"model come from the listing pages")
+    where, params = auction_filters(db, argparse.Namespace(model=args.model, model_def=model_def, since=args.since), 'a')
+    keep = set(OLD_FILTERS) if args.all else {name for name in OLD_FILTERS if getattr(args, f"include_{name}")}
+    result = export_rows(db, where, params, model_def, config['site']['source_name'], keep, withdrawn=args.all)
+    rows = result['rows']
+
+    waiting = db.query(f"SELECT COUNT(*) AS n FROM auctions a WHERE a.fetched_at IS NULL{where}", params)[0]['n']
+    skipped = [f"{n:,} {EXPORT_SKIPS.get(reason, reason)}" for reason, n in sorted(result['skipped'].items())]
+    if skipped:
+        print(f"left out: {', '.join(skipped)}")
+    if waiting:
+        print(f"{waiting:,} of the model's auctions aren't fetched yet; `model {args.model}` fetches them")
+    foreign = sum(1 for r in rows if r.row['result'] == 'sold' and r.row['currency'] != 'USD')
+    if foreign:
+        print(f"{foreign:,} sale(s) in other currencies are written without a price (the csv has the amount)")
+    if not rows:
+        print("nothing to export")
+        return 1
+    # ingest files a whole file under its first record's make and model
+    tags = sorted({r.row['model_slug'] or '?' for r in rows})
+    if not model_def and len(tags) > 1:
+        print(f"{args.model} covers {len(tags)} models ({', '.join(tags[:6])}{', ...' if len(tags) > 6 else ''}); "
+              f"export one of them, or follow the model with `model` first")
+        return 1
+
+    older = sum(1 for r in rows if (r.row['parser_version'] or 0) < PARSER_VERSION)
+    if older:
+        print(f"{older:,} of these were saved by an older parser, so their engine, mileage, colors and the like are "
+              f"missing; `model {args.model} --upgrade` fetches them again")
+    if model_def:
+        missing = [flag for flag, value in (('--make', model_def.make), ('--model-full', model_def.model_full),
+                                            ('--model-short', model_def.model_short)) if not value]
+        if missing:
+            print(f"{model_def.key} has no {', '.join(missing)}, so "
+                  f"{'every variant is Standard and ' if '--model-short' in missing or '--make' in missing else ''}"
+                  f"make and model come from the listing pages; `model {model_def.key} {' '.join(m + ' ...' for m in missing)}` "
+                  f"sets them")
+
+    name = model_def.output_name() if model_def else normalize_slug(args.model).replace('/', '-')
+    path = args.output or os.path.join(EXPORT_DIR, f"{name}_data.{args.format}")
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    (write_csv if args.format == 'csv' else write_json)(rows, path)
+    sold = sum(1 for r in rows if r.listing.result == 'Sold')
+    print(f"{len(rows):,} auction(s) ({sold:,} sold) written to {path}")
+    return 0
 
 
 def reset_errors(db: ActivityDB):
@@ -326,13 +634,21 @@ def truncate(n):
     return lambda value: text(value)[:n]
 
 
-def auction_filters(args, alias: str):
+def auction_filters(db: ActivityDB, args, alias: str):
     clauses, params = [], []
-    if args.model:
-        # a make takes in its models ("bmw" covers "bmw/e46-m3"); a range, unlike LIKE, can use the index
-        model = args.model.strip().strip('/').lower()
-        clauses.append(f"({alias}.model_slug = ? OR ({alias}.model_slug >= ? AND {alias}.model_slug < ?))")
-        params += [model, f"{model}/", f"{model}0"]
+    model_def = getattr(args, 'model_def', None)
+    if model_def:
+        # a model followed with `model`: what its feed listed, plus auctions tagged as it
+        condition, scope_params = db.model_scope(model_def, alias)
+        clauses.append(condition)
+        params += scope_params
+    elif args.model:
+        # a make takes in its models ("bmw" covers "bmw/e46-m3"); a range, unlike LIKE, can use the index. a short
+        # model slug ("e46-m3") is the tag's last part
+        model = normalize_slug(args.model)
+        clauses.append(f"({alias}.model_slug = ? OR ({alias}.model_slug >= ? AND {alias}.model_slug < ?)"
+                       f" OR substr({alias}.model_slug, -?) = ?)")
+        params += [model, f"{model}/", f"{model}0", len(model) + 1, f"/{model}"]
     if args.since:
         clauses.append(f"{alias}.end_ts >= ?")
         params.append(args.since)
@@ -388,6 +704,15 @@ def report_overview(db: ActivityDB, raw_path=None):
     print(f"  bids                : {counts['bids']:,}")
     print(f"  vehicles tracked    : {vehicles['vehicles'] or 0:,} ({vehicles['repeat_vehicles'] or 0:,} auctioned more than once)")
 
+    parts = db.query("""
+        SELECT COUNT(DISTINCT f.listing_id) AS known,
+               COUNT(DISTINCT CASE WHEN a.fetched_at IS NOT NULL THEN f.listing_id END) AS fetched
+        FROM feed_categories f JOIN auctions a ON a.listing_id = f.listing_id
+    """)[0]
+    if parts['known']:
+        print(f"  parts auctions      : {parts['known']:,} known from the parts feeds, {parts['fetched']:,} fetched "
+              f"(fetch leaves the rest till last)")
+
     # rows discovery stored carry its no_reserve flag; history-followed ones don't until the feed lists them
     feed_total = db.get_meta('feed_items_total')
     if feed_total:
@@ -422,9 +747,14 @@ def report_overview(db: ActivityDB, raw_path=None):
         print(f"  stored pages        : {', '.join(parts) or 'none'}")
 
 
+def scope_name(args) -> str:
+    model_def = getattr(args, 'model_def', None)
+    return (model_def.model_full or model_def.key) if model_def else (args.model or 'all models')
+
+
 def report_leaderboards(db: ActivityDB, args):
-    where, params = auction_filters(args, 'a')
-    scope = f" ({args.model or 'all models'}{', since ' + fmt_ts(args.since) if args.since else ''})"
+    where, params = auction_filters(db, args, 'a')
+    scope = f" ({scope_name(args)}{', since ' + fmt_ts(args.since) if args.since else ''})"
     # the matching auctions in one pass, so no leaderboard walks an index a row at a time; member names are
     # looked up only for the rows shown
     scoped = f"""scoped AS MATERIALIZED (
@@ -488,9 +818,9 @@ def report_leaderboards(db: ActivityDB, args):
 
 
 def report_pairs(db: ActivityDB, args):
-    where, params = auction_filters(args, 'a')
+    where, params = auction_filters(db, args, 'a')
     min_auctions = args.min_auctions or 3
-    scope = f", {args.model or 'all models'}{', since ' + fmt_ts(args.since) if args.since else ''}" if where else ''
+    scope = f", {scope_name(args)}{', since ' + fmt_ts(args.since) if args.since else ''}" if where else ''
     if where:
         pairs = f"""
             SELECT a.seller_slug, p.slug AS bidder_slug, COUNT(*) AS auctions_bid, SUM(p.won) AS won, SUM(p.n_bids) AS bids
@@ -578,12 +908,12 @@ def report_vehicle(db: ActivityDB, args):
 
 def report_resales(db: ActivityDB, args):
     # --since here means resold since, so only the model half of the usual filters applies to the auction
-    where, params = auction_filters(argparse.Namespace(model=args.model, since=None), 'a')
+    where, params = auction_filters(db, argparse.Namespace(model=args.model, model_def=args.model_def, since=None), 'a')
     if args.since:
         where += " AND r.sold_ts >= ?"
         params.append(args.since)
     min_resales = args.min_auctions or 2
-    scope = f" ({args.model or 'all models'}{', resold since ' + fmt_ts(args.since) if args.since else ''})"
+    scope = f" ({scope_name(args)}{', resold since ' + fmt_ts(args.since) if args.since else ''})"
 
     members = db.query(f"""
         SELECT r.slug, m.display_name, COUNT(*) AS resold, SUM(r.price_change > 0) AS gains,
@@ -715,7 +1045,8 @@ def report_member(db: ActivityDB, args):
 
 
 def add_discover_args(p):
-    p.add_argument('--max-pages', type=positive_int, help='stop after this many results pages')
+    p.add_argument('--max-pages', type=positive_int,
+                   help='stop after this many results pages (the site-wide feed, then each parts feed)')
     p.add_argument('--start-page', type=positive_int, help='results page to start from')
     p.add_argument('--reset-backfill-cursor', action='store_true', help='start the backfill over from page 1')
     p.add_argument('--backfill', action='store_true',
@@ -765,7 +1096,30 @@ def main(argv=None):
     sync.add_argument('--all', action='store_true',
                       help='fetch the whole queue, not just what this run discovered and re-fetches that are due')
 
-    for p in (discover, fetch, sync):
+    model = sub.add_parser('model', help="follow a model: its auctions from its model page's feed, their bid "
+                                         "histories, and a report")
+    model.add_argument('slug', nargs='?', help="the model page's slug, as in its address: 'chevrolet/c8', or the old "
+                                               "scraper's 'e46-m3'; a stored model's key also works")
+    model.add_argument('--json', metavar='FILE', help='follow the models in this file (the cli/input/cars_*.json format)')
+    model.add_argument('--make', help='make, for the export and for matching titles when the model page gives no feed')
+    model.add_argument('--model-full', help="model name for the export's model field, e.g. 'C8 Corvette'")
+    model.add_argument('--model-short', help="the model as titles write it, e.g. 'Corvette ' (variant and title matching)")
+    model.add_argument('--min-year', type=int, help='skip auctions of model years before this')
+    model.add_argument('--max-year', type=int, help='skip auctions of model years after this')
+    model.add_argument('--filter-url', metavar='URL',
+                       help="the listings-filter request the model page's 'show more' sends, copied from the browser's "
+                            "network tab; used instead of reading the model page")
+    model.add_argument('--refresh-filter', action='store_true', help='read the model page again for its feed filter')
+    model.add_argument('--max-pages', type=positive_int, help='read at most this many feed pages')
+    add_fetch_args(model)
+    model.add_argument('--no-report', action='store_true', help="don't print the model's report at the end")
+    model.add_argument('--top', type=positive_int, default=15, help='rows per report table')
+
+    for p in (fetch, sync):
+        p.add_argument('--skip-parts', action='store_true',
+                       help='leave auctions the parts feeds listed (activity.parts_categories) for a later run')
+
+    for p in (discover, fetch, sync, model):
         p.add_argument('--since', type=date_arg,
                        help='only auctions ending on or after YYYY-MM-DD (bat history links from them are still followed)')
         p.add_argument('--delay', type=non_negative_float, default=3.0,
@@ -775,6 +1129,21 @@ def main(argv=None):
         p.add_argument('--active-hours', type=active_hours_arg, metavar='HH:MM-HH:MM',
                        help='only send requests in this local window, e.g. 08:00-22:00, remembered for later runs; '
                             'off to remove')
+
+    export = sub.add_parser('export', help="write a model's auctions as the selenium scraper's json, for normalize, "
+                                           "ingest and the llm step (no network)")
+    export.add_argument('--model', required=True, help="a followed model's key or slug, in either spelling")
+    export.add_argument('--output', metavar='FILE',
+                        help='where to write (default: data/json/output/raw/<slug>_data.json, or .csv)')
+    export.add_argument('--format', choices=('json', 'csv'), default='json',
+                        help="json: the old files' shape exactly; csv: the same fields plus the crawler's ids and counts")
+    export.add_argument('--since', type=date_arg, help='only auctions ending on or after YYYY-MM-DD')
+    export.add_argument('--all', action='store_true',
+                        help="keep everything the old scraper left out: the filters below, and withdrawn auctions. the "
+                             "model's year range always applies (change it with `model --min-year/--max-year`)")
+    export.add_argument('--include-non-usa', action='store_true', help='keep listings outside the USA')
+    export.add_argument('--include-modified', action='store_true', help="keep titles that say 'modified'")
+    export.add_argument('--include-no-vin', action='store_true', help='keep listings without a 17-character vin')
 
     sub.add_parser('link', help='rebuild the participants table and regroup auctions into vehicles (no network)')
     reparse = sub.add_parser('reparse', help='run the current parser over stored pages again (no network)')
@@ -796,6 +1165,8 @@ def main(argv=None):
                         help='minimum shared auctions for --pairs (default 3) or resales for --resales (default 2)')
 
     args = parser.parse_args(argv)
+    if args.command == 'model' and bool(args.slug) == bool(args.json):
+        parser.error("model takes a slug or --json FILE, one of the two")
     if args.command == 'report':
         # say so rather than quietly ignore a filter
         if (args.member or args.vehicle) and (args.model or args.since):
@@ -836,7 +1207,15 @@ def run_command(args, parser: argparse.ArgumentParser, config: dict, urls) -> in
             reset_errors(db)
             return 0
 
+        if args.command == 'export':
+            return run_export(db, args, config)
+
         if args.command == 'report':
+            try:
+                args.model_def = resolve_model(db, args.model) if args.model else None
+            except ValueError as e:
+                print(e)
+                return 1
             if args.vehicle:
                 report_vehicle(db, args)
             elif args.member:
@@ -845,6 +1224,8 @@ def run_command(args, parser: argparse.ArgumentParser, config: dict, urls) -> in
                 report_resales(db, args)
             elif args.pairs:
                 report_pairs(db, args)
+            elif args.model:
+                report_model(db, args)
             else:
                 # the overview describes the whole database, so a filtered report leaves it out
                 if not (args.model or args.since):
@@ -866,10 +1247,19 @@ def run_command(args, parser: argparse.ArgumentParser, config: dict, urls) -> in
             print_vehicle_stats(stats['vehicles'])
             return 1 if stats['failed'] and not stats['reparsed'] else 0
 
-        raw_store = RawStore(raw_path) if raw_path and args.command in ('fetch', 'sync') else None
+        raw_store = RawStore(raw_path) if raw_path and args.command in ('fetch', 'sync', 'model') else None
+        models, created = None, set()
+        if args.command == 'model':
+            try:
+                models, created = model_definitions(args, db, parser)
+            except ModelRefError as e:
+                print(e)
+                return 1
         pipeline = build_pipeline(args, db, config, raw_store)
         status = 0
         try:
+            if args.command == 'model':
+                status = run_model(args, pipeline, models, created)
             discovered = None
             if args.command in ('discover', 'sync'):
                 discovered = run_discover(args, pipeline)

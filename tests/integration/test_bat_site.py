@@ -3,7 +3,7 @@ from bs4 import BeautifulSoup
 import sys
 import os
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 
 from sites.bringatrailer.site import BringATrailerSite
 from core.models.scrape_config import ScrapeConfig
@@ -14,7 +14,7 @@ class TestBringATrailerSiteExtraction(unittest.TestCase):
     def setUp(self):
         config_path = os.path.join(
             os.path.dirname(__file__),
-            '../../../config/sites/bringatrailer.yaml'
+            '../../config/sites/bringatrailer.yaml'
         )
         self.site = BringATrailerSite(config_path)
     

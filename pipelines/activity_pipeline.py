@@ -1,13 +1,15 @@
 import time
 import sqlite3
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Callable, List, Optional
+
+from core.models.activity import AuctionSummary
 
 from sites.bringatrailer.http_client import (
     BaTClient, HTTPStatusError, RateLimited, RobotsUnavailable, SiteUnavailable, challenge_marker
 )
 from sites.bringatrailer.activity_parser import (
-    ActivityParser, ListingParseError, NotFinal, PARSER_VERSION, parse_results_page
+    ActivityParser, FRAGMENTS_COMPLETE_SINCE, ListingParseError, NotFinal, PARSER_VERSION, parse_results_page
 )
 from storage.activity_db import ActivityDB
 from storage.raw_store import RawStore
@@ -44,6 +46,14 @@ def fmt_ts(ts: Optional[int]) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%Y-%m-%d')
 
 
+def reparsed_version(raw) -> int:
+    """the parser version a reparse of a stored page can vouch for: fragments an older parser kept may lack
+    elements the current one reads, so the listing stays due for `fetch --upgrade`"""
+    if raw.kind == 'fragments' and raw.parser_version < FRAGMENTS_COMPLETE_SINCE:
+        return raw.parser_version
+    return PARSER_VERSION
+
+
 class ActivityPipeline:
 
     def __init__(
@@ -67,6 +77,8 @@ class ActivityPipeline:
         self.max_site_failures = max_site_failures
         self.max_failures = max_failures
         self.max_unmarked_ended = max_unmarked_ended
+        # results-feed categories whose auctions are fetched last (or not at all, with skip_parts)
+        self.parts_categories = {int(k): v for k, v in (activity_config.get('parts_categories') or {}).items()}
 
     def discover(
         self,
@@ -74,14 +86,21 @@ class ActivityPipeline:
         max_pages: Optional[int] = None,
         since_ts: Optional[int] = None,
         stop_after_known: int = 2,
-        backfill: bool = False
+        backfill: bool = False,
+        params: Optional[dict] = None,
+        scope: str = '',
+        on_page: Optional[Callable[[List[AuctionSummary]], None]] = None,
+        check: Optional[Callable[[dict], None]] = None
     ) -> dict:
-        cursor = int(self.db.get_meta('backfill_next_page') or 1)
+        """walk a results feed newest first. params narrow the feed (a model page's filter); scope prefixes the meta
+        keys that hold its cursor and watermark, so each feed resumes on its own; on_page sees each stored page, and
+        check each response before anything in it is stored (it raises to stop the walk)"""
+        cursor = int(self.db.get_meta(scope + 'backfill_next_page') or 1)
         if start_page is None:
             start_page = cursor if backfill else 1
         elif backfill and start_page > cursor:
             print(f"  --start-page {start_page} is past the backfill cursor ({cursor}), so the cursor stays put")
-        watermark = self.db.get_meta('discover_watermark')
+        watermark = self.db.get_meta(scope + 'discover_watermark')
         watermark = int(watermark) if watermark else None
 
         page = start_page
@@ -95,7 +114,9 @@ class ActivityPipeline:
 
         while max_pages is None or pages_done < max_pages:
             try:
+                # paging and order are ours: the watermark and cursor rely on newest-first pages
                 data = self.client.get_json(self.endpoint, params={
+                    **(params or {}),
                     'page': page,
                     'per_page': self.per_page,
                     'get_items': 1,
@@ -107,13 +128,20 @@ class ActivityPipeline:
                 if e.status == 400 and page > 1:
                     print(f"  page {page}: http 400, taken as past the last page")
                     complete = True
+                    # the feed ends at or above the cursor, so the backfill has seen all of it
+                    if backfill and page <= cursor:
+                        self.db.set_meta(scope + 'backfill_reached', '0')
                     break
                 raise
 
+            if check:
+                check(data)
             summaries = parse_results_page(data)
             if not summaries:
                 print("  no more results")
                 complete = True
+                if backfill and page <= cursor:
+                    self.db.set_meta(scope + 'backfill_reached', '0')
                 break
 
             skipped = []
@@ -123,11 +151,13 @@ class ActivityPipeline:
                 print(f"    {unreadable} item(s) on page {page} had no usable id or url")
             for listing_id, error in skipped:
                 print(f"    couldn't store listing {listing_id}: {error}")
+            if on_page:
+                on_page(summaries)
             new_total += new
             seen_ids += [s.listing_id for s in summaries]
             pages_done += 1
             if data.get('items_total'):
-                self.db.set_meta('feed_items_total', str(data['items_total']))
+                self.db.set_meta(scope + 'feed_items_total', str(data['items_total']))
 
             end_times = [s.end_ts for s in summaries if s.end_ts]
             oldest = min(end_times) if end_times else None
@@ -135,14 +165,17 @@ class ActivityPipeline:
                 top = max(end_times)
                 # the backfill covers everything below its first page; incremental runs cover what ends after it
                 if backfill and watermark is None:
-                    self.db.set_meta('discover_watermark', str(top))
+                    self.db.set_meta(scope + 'discover_watermark', str(top))
             pages_total = data.get('pages_total')
             print(f"  page {page}/{pages_total or '?'}: {len(summaries)} auctions, {new} new (back to {fmt_ts(oldest)})")
 
             # only a page that continues where the saved cursor stopped moves it, so a jump ahead skips nothing
             if backfill and page == cursor:
                 cursor = page + 1
-                self.db.set_meta('backfill_next_page', str(cursor))
+                self.db.set_meta(scope + 'backfill_next_page', str(cursor))
+                # everything ending after this has been seen, which tells a later --since whether to go deeper
+                if oldest is not None:
+                    self.db.set_meta(scope + 'backfill_reached', str(oldest))
 
             below_watermark = watermark is None or (oldest is not None and oldest < watermark - WATERMARK_MARGIN)
             if since_ts and oldest and oldest < since_ts:
@@ -161,14 +194,91 @@ class ActivityPipeline:
             if pages_total and page >= pages_total:
                 print("  reached last page")
                 complete = True
+                if backfill and page + 1 == cursor:
+                    self.db.set_meta(scope + 'backfill_reached', '0')
                 break
             page += 1
 
         # an interrupted run, or one cut short by --max-pages, leaves the watermark where it was
         if not backfill and start_page == 1 and complete and top:
-            self.db.set_meta('discover_watermark', str(top))
+            self.db.set_meta(scope + 'discover_watermark', str(top))
 
         return {'pages': pages_done, 'seen': len(seen_ids), 'new': new_total, 'seen_ids': seen_ids, 'complete': complete}
+
+    def feed_covered(self, scope: str, since_ts: Optional[int]) -> bool:
+        """whether a feed's backfill has seen everything down to since_ts, or all of it. a feed nothing was ever
+        stored from (an empty first page) isn't covered: it may simply have had nothing yet"""
+        if not self.db.get_meta(scope + 'discover_watermark'):
+            return False
+        reached = self.db.get_meta(scope + 'backfill_reached')
+        return reached is not None and (int(reached) == 0 or (since_ts is not None and int(reached) < since_ts))
+
+    def discover_feed(
+        self,
+        since_ts: Optional[int] = None,
+        max_pages: Optional[int] = None,
+        params: Optional[dict] = None,
+        scope: str = '',
+        on_page: Optional[Callable[[List[AuctionSummary]], None]] = None,
+        check: Optional[Callable[[dict], None]] = None
+    ) -> dict:
+        """bring one feed up to date, however the last run ended. the backfill goes first, from its cursor down to
+        since_ts (or the feed's end), so a page budget moves it on rather than rereading the top; then what ended
+        after the watermark, and only that: the backfill covers everything below it. an interrupted or budgeted run
+        leaves the cursor and watermark where they were, so the next one leaves no hole"""
+        watermark = self.db.get_meta(scope + 'discover_watermark')
+        passes = []
+        remaining = max_pages
+
+        def walk(**kwargs) -> dict:
+            nonlocal remaining
+            stats = self.discover(max_pages=remaining, params=params, scope=scope, on_page=on_page, check=check,
+                                  **kwargs)
+            passes.append(stats)
+            if remaining is not None:
+                remaining -= stats['pages']
+            return stats
+
+        older = self.feed_covered(scope, since_ts)
+        if older:
+            print("  older auctions were covered by an earlier run")
+        else:
+            cursor = int(self.db.get_meta(scope + 'backfill_next_page') or 1)
+            # from a page before the cursor: auctions leaving the feed since the last run move the rest up
+            start = max(1, cursor - 1)
+            print(f"  back to {fmt_ts(since_ts) if since_ts else 'the first auction'}, from page {start}")
+            walk(since_ts=since_ts, backfill=True, start_page=start)
+            older = self.feed_covered(scope, since_ts)
+
+        # a first run's backfill starts at the top of the feed, so there's nothing newer to look for yet
+        newer = watermark is None
+        if watermark and (remaining is None or remaining > 0):
+            print("  auctions newer than the last complete run")
+            newer = walk(since_ts=max(since_ts or 0, int(watermark) - WATERMARK_MARGIN))['complete']
+
+        seen_ids = list(dict.fromkeys(i for p in passes for i in p['seen_ids']))
+        return {
+            'pages': sum(p['pages'] for p in passes), 'seen': len(seen_ids), 'new': sum(p['new'] for p in passes),
+            'seen_ids': seen_ids, 'complete': older and newer
+        }
+
+    def discover_parts(self, since_ts: Optional[int] = None, max_pages: Optional[int] = None) -> dict:
+        """walk each parts category's feed (category[]=<id>) back to since_ts, recording which auctions it lists so
+        fetch can leave them till last. each feed keeps its own cursor and watermark, so after its first walk only
+        what's new is read: about one request per 60 parts auctions in all"""
+        totals = {'pages': 0, 'seen': 0, 'new': 0, 'complete': True}
+        for category, name in self.parts_categories.items():
+            print(f"  {name} (category {category})")
+
+            def record(summaries: List[AuctionSummary], category=category):
+                self.db.record_feed_category(category, [s.listing_id for s in summaries])
+
+            stats = self.discover_feed(since_ts=since_ts, max_pages=max_pages, params={'category[]': [category]},
+                                       scope=f"category:{category}:", on_page=record)
+            for key in ('pages', 'seen', 'new'):
+                totals[key] += stats[key]
+            totals['complete'] = totals['complete'] and stats['complete']
+        return totals
 
     def fetch(
         self,
@@ -179,27 +289,45 @@ class ActivityPipeline:
         follow_history: bool = True,
         urls: Optional[List[str]] = None,
         listing_ids: Optional[List[int]] = None,
-        due_refetches: bool = False
+        due_refetches: bool = False,
+        history_from: Optional[List[int]] = None,
+        skip_parts: bool = False
     ) -> dict:
         """listing_ids limits the queue to those listings (what a sync just discovered, or a scoped re-fetch), and
         due_refetches adds already-fetched listings whose re-fetch is due. links found on fetched pages are always
-        followed, straight after the page that listed them, and count against limit like any other fetch"""
+        followed, straight after the page that listed them, and count against limit like any other fetch; with
+        listing_ids, history_from also picks up links an earlier run found on these listings but didn't follow.
+        auctions the parts feeds listed come after everything else, or with skip_parts wait for another run"""
         upgrade_below = PARSER_VERSION if upgrade else None
+        last = list(self.parts_categories)
+        skip = last if skip_parts else []
         if urls:
             queue = [{'listing_id': None, 'url': url, 'end_ts': None, 'source': 'url'} for url in urls]
             waiting = None
         else:
             # links left over from earlier runs go first, so a --limit budget finishes the chains it started
-            history = self.db.pending_history(max_attempts) if follow_history and listing_ids is None else []
+            if not follow_history:
+                history = []
+            elif listing_ids is None:
+                history = self.db.pending_history(max_attempts)
+            else:
+                history = self.db.pending_history(max_attempts, history_from) if history_from is not None else []
             # a sync's queue is bounded by what its discovery saw, so it's read whole and counted exactly;
             # the full backlog is only counted
             whole = limit is None or due_refetches
-            rows = list(self.db.pending(None if whole else limit, since_ts, max_attempts, upgrade_below, listing_ids))
+            rows = list(self.db.pending(None if whole else limit, since_ts, max_attempts, upgrade_below, listing_ids,
+                                        last_categories=last, skip_categories=skip))
             if due_refetches:
-                rows += self.db.pending(None, since_ts, max_attempts, fetched_only=True)
+                rows += self.db.pending(None, since_ts, max_attempts, fetched_only=True, last_categories=last,
+                                        skip_categories=skip)
             queue = [dict(r, source='history') for r in history] + [dict(r, source='queue') for r in rows]
             waiting = None if whole else len(history) + self.db.pending_count(since_ts, max_attempts, upgrade_below,
-                                                                                listing_ids)
+                                                                                listing_ids, skip_categories=skip)
+            if skip:
+                left = (self.db.pending_count(since_ts, max_attempts, upgrade_below, listing_ids)
+                        - self.db.pending_count(since_ts, max_attempts, upgrade_below, listing_ids, skip_categories=skip))
+                if left:
+                    print(f"  {left} parts auction(s) left for a run without --skip-parts")
 
         queued = set()
         unique = []
@@ -326,7 +454,7 @@ class ActivityPipeline:
                     detail = self.parser.parse_listing(raw.html, raw.url, now=raw.fetched_at)
                     if detail.listing_id != raw.listing_id:
                         raise ListingMismatch(f"stored page is listing {detail.listing_id}")
-                    self.db.save_detail(detail, raw.fetched_at, PARSER_VERSION)
+                    self.db.save_detail(detail, raw.fetched_at, reparsed_version(raw))
                     reparsed += 1
                 except Exception as e:
                     failed += 1

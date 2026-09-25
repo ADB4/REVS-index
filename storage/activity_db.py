@@ -3,10 +3,11 @@ import re
 import json
 import time
 import sqlite3
-from collections import defaultdict
-from typing import Iterable, List, Optional
+from collections import Counter, defaultdict
+from typing import Iterable, List, Optional, Tuple
 
 from core.models.activity import AuctionSummary, AuctionDetail, Member
+from core.models.model_definition import ModelDefinition, normalize_slug, slugify, title_year
 
 
 # a parts listing can quote its donor car's vin; only bat history ties one to a car
@@ -24,6 +25,11 @@ def vehicle_key(vin: Optional[str], chassis: Optional[str], make: Optional[str])
     return None
 
 
+def json_list(values: List[str]) -> Optional[str]:
+    """a list column's value; an empty list is None, so a page that yielded nothing keeps what an earlier fetch stored"""
+    return json.dumps(values, ensure_ascii=False) if values else None
+
+
 # the listing id is the key; a url can move between listings (renames, relists), so it isn't unique
 AUCTIONS_TABLE = """
 CREATE TABLE IF NOT EXISTS auctions (
@@ -37,6 +43,17 @@ CREATE TABLE IF NOT EXISTS auctions (
     era TEXT,
     origin TEXT,
     category TEXT,
+    -- every category tag, as a json list; category is the first
+    categories TEXT,
+    convertible INTEGER,
+    engine TEXT,
+    transmission TEXT,
+    mileage INTEGER,
+    exterior_color TEXT,
+    interior_color TEXT,
+    -- json lists of the listing details and the excerpt's paragraphs
+    listing_details TEXT,
+    excerpt TEXT,
     chassis TEXT,
     chassis_raw TEXT,
     vin TEXT,
@@ -113,6 +130,39 @@ CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT
 );
+
+-- models followed with `activity.py model`, as the old scraper's cli/input json describes them; the json columns
+-- are lists, except filters: each slug's listings-filter parameters, read from its model page
+CREATE TABLE IF NOT EXISTS models (
+    key TEXT PRIMARY KEY,
+    slugs TEXT NOT NULL,
+    make TEXT,
+    model_full TEXT,
+    model_short TEXT,
+    min_year INTEGER,
+    max_year INTEGER,
+    filters TEXT,
+    tag_slugs TEXT,
+    updated_at INTEGER
+);
+
+-- auctions a results-feed category (activity.parts_categories in the yaml) listed, so fetch can leave them till last
+CREATE TABLE IF NOT EXISTS feed_categories (
+    listing_id INTEGER NOT NULL REFERENCES auctions(listing_id),
+    category INTEGER NOT NULL,
+    PRIMARY KEY (listing_id, category)
+) WITHOUT ROWID;
+
+-- auctions a model's discovery turned up. status: 'member' (its model page's feed listed it, or its page's model
+-- tag matched), 'unchecked' (a title match not fetched yet), 'other_model' (a title match whose page is tagged as
+-- another model), 'out_of_years' (outside the model's year range, so never fetched for it)
+CREATE TABLE IF NOT EXISTS model_listings (
+    model_key TEXT NOT NULL REFERENCES models(key),
+    listing_id INTEGER NOT NULL REFERENCES auctions(listing_id),
+    source TEXT NOT NULL,
+    status TEXT NOT NULL,
+    PRIMARY KEY (model_key, listing_id)
+) WITHOUT ROWID;
 """
 
 # columns added after databases already existed; ALTERed in on open
@@ -124,10 +174,20 @@ ADDED_COLUMNS = [
     ('auctions', 'parser_version', 'INTEGER'),
     ('auctions', 'chassis_raw', 'TEXT'),
     ('auctions', 'refetch', 'INTEGER NOT NULL DEFAULT 0'),
+    ('auctions', 'categories', 'TEXT'),
+    ('auctions', 'convertible', 'INTEGER'),
+    ('auctions', 'engine', 'TEXT'),
+    ('auctions', 'transmission', 'TEXT'),
+    ('auctions', 'mileage', 'INTEGER'),
+    ('auctions', 'exterior_color', 'TEXT'),
+    ('auctions', 'interior_color', 'TEXT'),
+    ('auctions', 'listing_details', 'TEXT'),
+    ('auctions', 'excerpt', 'TEXT'),
 ]
 
-# 2: auctions.url no longer UNIQUE; 3: participants table
-SCHEMA_VERSION = 3
+# 2: auctions.url no longer UNIQUE; 3: participants table; 4: models and model_listings; 5: feed_categories
+# (4 and 5 only added tables, which TABLES creates on open)
+SCHEMA_VERSION = 5
 
 # fills participants for the listings a WHERE clause on bids picks
 PARTICIPANTS_INSERT = """
@@ -159,6 +219,7 @@ CREATE INDEX IF NOT EXISTS idx_participants_slug ON participants(slug, n_bids, w
 CREATE INDEX IF NOT EXISTS idx_participants_seller ON participants(seller_slug, slug, n_bids, won);
 CREATE INDEX IF NOT EXISTS idx_links_related_url ON listing_links(related_url);
 CREATE INDEX IF NOT EXISTS idx_links_related_id ON listing_links(related_listing_id);
+CREATE INDEX IF NOT EXISTS idx_model_listings_listing ON model_listings(listing_id);
 """
 
 # cars a member won and later sold again on bat themselves. scope narrows the auctions looked at, a whole
@@ -428,8 +489,13 @@ class ActivityDB:
             self.conn.execute("""
                 UPDATE auctions SET
                     title = COALESCE(?, title),
+                    year = COALESCE(year, ?),
                     make = COALESCE(?, make), model = COALESCE(?, model), model_slug = COALESCE(?, model_slug),
                     era = COALESCE(?, era), origin = COALESCE(?, origin), category = COALESCE(?, category),
+                    categories = COALESCE(?, categories), convertible = COALESCE(?, convertible),
+                    engine = COALESCE(?, engine), transmission = COALESCE(?, transmission), mileage = COALESCE(?, mileage),
+                    exterior_color = COALESCE(?, exterior_color), interior_color = COALESCE(?, interior_color),
+                    listing_details = COALESCE(?, listing_details), excerpt = COALESCE(?, excerpt),
                     chassis = COALESCE(?, chassis), chassis_raw = COALESCE(?, chassis_raw), vin = COALESCE(?, vin),
                     country = COALESCE(?, country), location = COALESCE(?, location),
                     result = COALESCE(NULLIF(?, 'unknown'), result),
@@ -448,7 +514,13 @@ class ActivityDB:
                 WHERE listing_id = ?
             """, (
                 detail.title,
+                # listings reached through bat history were never in the feed, which is where a year comes from
+                title_year(detail.title),
                 detail.make, detail.model, detail.model_slug, detail.era, detail.origin, detail.category,
+                json_list(detail.categories), None if detail.convertible is None else int(detail.convertible),
+                detail.engine, detail.transmission, detail.mileage,
+                detail.exterior_color, detail.interior_color,
+                json_list(detail.listing_details), json_list(detail.excerpt),
                 detail.chassis, detail.chassis_raw, detail.vin,
                 detail.country, detail.location,
                 detail.result,
@@ -546,24 +618,37 @@ class ActivityDB:
         listing_ids: Optional[Iterable[int]] = None,
         now: Optional[float] = None,
         grace: int = REFETCH_GRACE,
-        fetched_only: bool = False
+        fetched_only: bool = False,
+        last_categories: Iterable[int] = (),
+        skip_categories: Iterable[int] = ()
     ) -> List[sqlite3.Row]:
         """listings to fetch: never fetched, flagged for a re-fetch, possibly saved before they were final,
         reserve-not-met ones whose deal window has passed, and (with upgrade_below) older parser versions.
-        fetched_only leaves out the never-fetched backlog"""
-        where, params = self._pending_where(since_ts, max_attempts, upgrade_below, listing_ids, now, grace, fetched_only)
-        sql = f"SELECT listing_id, url, end_ts FROM auctions WHERE {where} ORDER BY fetched_at IS NOT NULL, end_ts DESC"
+        fetched_only leaves out the never-fetched backlog. auctions a feed category in last_categories listed come
+        after all the rest; those in skip_categories are left out"""
+        where, params = self._pending_where(since_ts, max_attempts, upgrade_below, listing_ids, now, grace, fetched_only,
+                                            skip_categories)
+        params['last'] = json.dumps(list(last_categories))
+        sql = f"""
+            SELECT listing_id, url, end_ts FROM auctions WHERE {where}
+            ORDER BY listing_id IN (SELECT listing_id FROM feed_categories
+                                    WHERE category IN (SELECT value FROM json_each(:last))),
+                     fetched_at IS NOT NULL, end_ts DESC
+        """
         if limit is not None:
             sql += " LIMIT :limit"
             params['limit'] = limit
         return self.conn.execute(sql, params).fetchall()
 
     def pending_count(self, since_ts: Optional[int] = None, max_attempts: int = 3, upgrade_below: Optional[int] = None,
-                      listing_ids: Optional[Iterable[int]] = None, fetched_only: bool = False) -> int:
-        where, params = self._pending_where(since_ts, max_attempts, upgrade_below, listing_ids, None, REFETCH_GRACE, fetched_only)
+                      listing_ids: Optional[Iterable[int]] = None, fetched_only: bool = False,
+                      skip_categories: Iterable[int] = ()) -> int:
+        where, params = self._pending_where(since_ts, max_attempts, upgrade_below, listing_ids, None, REFETCH_GRACE,
+                                            fetched_only, skip_categories)
         return self.conn.execute(f"SELECT COUNT(*) FROM auctions WHERE {where}", params).fetchone()[0]
 
-    def _pending_where(self, since_ts, max_attempts, upgrade_below, listing_ids, now, grace, fetched_only):
+    def _pending_where(self, since_ts, max_attempts, upgrade_below, listing_ids, now, grace, fetched_only,
+                       skip_categories=()):
         stale = " OR COALESCE(parser_version, 0) < :upgrade" if upgrade_below else ""
         where = f"""
             fetch_attempts < :max_attempts AND (
@@ -584,17 +669,32 @@ class ActivityDB:
         if listing_ids is not None:
             where += " AND listing_id IN (SELECT value FROM json_each(:ids))"
             params['ids'] = json.dumps(list(listing_ids))
+        skip = list(skip_categories)
+        if skip:
+            where += (" AND listing_id NOT IN (SELECT listing_id FROM feed_categories "
+                      "WHERE category IN (SELECT value FROM json_each(:skip)))")
+            params['skip'] = json.dumps(skip)
         return where, params
 
-    def pending_history(self, max_attempts: int = 3) -> List[sqlite3.Row]:
-        return self.conn.execute("""
+    def pending_history(self, max_attempts: int = 3, from_ids: Optional[Iterable[int]] = None) -> List[sqlite3.Row]:
+        """bat history links not fetched yet. from_ids keeps the urls these listings' pages link to, including ones
+        discovery has stored but nobody fetched (a whole-queue fetch gets those from pending() instead). a url given
+        up on stays given up on, whichever listing linked it"""
+        target = "related_listing_id IS NULL"
+        scope = ""
+        if from_ids is not None:
+            target = ("(related_listing_id IS NULL OR related_listing_id IN ("
+                      "SELECT listing_id FROM auctions WHERE fetched_at IS NULL AND fetch_attempts < :max))")
+            scope = ("AND related_url IN (SELECT related_url FROM listing_links "
+                     "WHERE listing_id IN (SELECT value FROM json_each(:ids)))")
+        return self.conn.execute(f"""
             SELECT NULL AS listing_id, related_url AS url, MAX(related_end_ts) AS end_ts
             FROM listing_links
-            WHERE related_listing_id IS NULL
+            WHERE {target} {scope}
             GROUP BY related_url
-            HAVING MAX(follow_attempts) < ?
+            HAVING MAX(follow_attempts) < :max
             ORDER BY MAX(related_end_ts) DESC, MIN(rowid)
-        """, (max_attempts,)).fetchall()
+        """, {'max': max_attempts, 'ids': json.dumps(list(from_ids or []))}).fetchall()
 
     def needs_fetch(self, url: str, max_attempts: int = 3) -> bool:
         """whether a linked url is worth a request: not fetched yet, and not given up on"""
@@ -751,6 +851,166 @@ class ActivityDB:
         ).fetchall()
         return {r['listing_id'] for r in rows}
 
+    def save_model(self, model: ModelDefinition, now: Optional[int] = None) -> None:
+        with self.conn:
+            self.conn.execute("""
+                INSERT INTO models (key, slugs, make, model_full, model_short, min_year, max_year, filters, tag_slugs,
+                                    updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    slugs = excluded.slugs, make = excluded.make, model_full = excluded.model_full,
+                    model_short = excluded.model_short, min_year = excluded.min_year, max_year = excluded.max_year,
+                    filters = excluded.filters, tag_slugs = excluded.tag_slugs, updated_at = excluded.updated_at
+            """, (
+                model.key, json.dumps(model.slugs), model.make, model.model_full, model.model_short,
+                model.min_year, model.max_year, json.dumps(model.filters), json.dumps(model.tag_slugs),
+                int(time.time() if now is None else now)
+            ))
+
+    def record_feed_category(self, category: int, listing_ids: Iterable[int]) -> None:
+        """auctions a results-feed category listed; one discovery couldn't store is skipped"""
+        with self.conn:
+            self.conn.executemany("""
+                INSERT INTO feed_categories (listing_id, category)
+                SELECT ?, ? WHERE EXISTS (SELECT 1 FROM auctions WHERE listing_id = ?)
+                ON CONFLICT(listing_id, category) DO NOTHING
+            """, [(listing_id, category, listing_id) for listing_id in listing_ids])
+
+    def delete_model(self, key: str) -> bool:
+        """forget a model nothing was recorded for, e.g. one whose slug turned out wrong; False if it has auctions"""
+        with self.conn:
+            if self.conn.execute("SELECT 1 FROM model_listings WHERE model_key = ? LIMIT 1", (key,)).fetchone():
+                return False
+            self.conn.execute("DELETE FROM models WHERE key = ?", (key,))
+            self.conn.execute("DELETE FROM meta WHERE key >= ? AND key < ?", (f"model:{key}:", f"model:{key};"))
+        return True
+
+    def models(self) -> List[ModelDefinition]:
+        return [ModelDefinition(
+            key=r['key'], slugs=json.loads(r['slugs']), make=r['make'], model_full=r['model_full'],
+            model_short=r['model_short'], min_year=r['min_year'], max_year=r['max_year'],
+            filters=json.loads(r['filters'] or '{}'), tag_slugs=json.loads(r['tag_slugs'] or '[]')
+        ) for r in self.conn.execute("SELECT * FROM models ORDER BY key")]
+
+    def find_models(self, ref: str) -> List[ModelDefinition]:
+        """stored models a key or slug names, in either spelling ('e46-m3' or 'bmw/e46-m3'); an exact key wins"""
+        models = self.models()
+        exact = [m for m in models if normalize_slug(m.key) == normalize_slug(ref)]
+        return exact or [m for m in models if m.names(ref)]
+
+    def record_model_listings(self, key: str, rows: Iterable, source: str) -> int:
+        """store (listing_id, status) pairs for a model; returns how many are new to it. what a model page's own
+        feed says wins; a title match never overrides what's already known"""
+        rows = list(rows)
+        conflict = ("DO UPDATE SET source = excluded.source, status = excluded.status" if source == 'feed'
+                    else "DO NOTHING")
+        with self.conn:
+            before = self.conn.execute("SELECT COUNT(*) FROM model_listings WHERE model_key = ?", (key,)).fetchone()[0]
+            # a feed item discovery couldn't store has no auctions row to point at, and is skipped here too
+            self.conn.executemany(f"""
+                INSERT INTO model_listings (model_key, listing_id, source, status)
+                SELECT ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM auctions WHERE listing_id = ?)
+                ON CONFLICT(model_key, listing_id) {conflict}
+            """, [(key, listing_id, source, status, listing_id) for listing_id, status in rows])
+            after = self.conn.execute("SELECT COUNT(*) FROM model_listings WHERE model_key = ?", (key,)).fetchone()[0]
+        return after - before
+
+    def title_candidates(self, model: ModelDefinition, since_ts: int) -> List[int]:
+        """auctions ending since since_ts that the model hasn't seen yet and whose titles look like it"""
+        rows = self.conn.execute("""
+            SELECT listing_id, title FROM auctions
+            WHERE end_ts >= ? AND listing_id NOT IN (SELECT listing_id FROM model_listings WHERE model_key = ?)
+        """, (since_ts, model.key)).fetchall()
+        return [r['listing_id'] for r in rows if model.title_matches(r['title'])]
+
+    def classify_model_candidates(self, model: ModelDefinition) -> dict:
+        """title matches whose pages are fetched: members if the page's model tag is the model's, set aside as
+        another model's if not, so they're neither reported nor fetched for it again. checked again each time, so
+        a slug added to the model later takes them back in. returns the changes, with the tags ruled out"""
+        rows = self.conn.execute("""
+            SELECT ml.listing_id, ml.status, a.model_slug, a.make FROM model_listings ml
+            JOIN auctions a ON a.listing_id = ml.listing_id
+            WHERE ml.model_key = ? AND ml.source = 'title' AND ml.status IN ('unchecked', 'member', 'other_model')
+              AND a.fetched_at IS NOT NULL
+        """, (model.key,)).fetchall()
+        updates, other_tags = [], Counter()
+        for r in rows:
+            status = 'member' if model.matches_tag(r['model_slug'], r['make']) else 'other_model'
+            if status != r['status']:
+                updates.append((status, model.key, r['listing_id']))
+                if status == 'other_model':
+                    other_tags[r['model_slug'] or '(no model tag)'] += 1
+        with self.conn:
+            self.conn.executemany("UPDATE model_listings SET status = ? WHERE model_key = ? AND listing_id = ?", updates)
+        return {'member': sum(u[0] == 'member' for u in updates), 'other_model': sum(u[0] == 'other_model' for u in updates),
+                'other_tags': other_tags}
+
+    def apply_year_range(self, model: ModelDefinition) -> int:
+        """re-sort what a model's discovery recorded after its year range changed: auctions outside the range are set
+        aside, and ones set aside that are inside it again count (a title match goes back to be checked). a title
+        match ruled out as another model's stays so. returns how many changed"""
+        rows = self.conn.execute("""
+            SELECT ml.listing_id, ml.source, ml.status, a.year, a.title FROM model_listings ml
+            JOIN auctions a ON a.listing_id = ml.listing_id
+            WHERE ml.model_key = ? AND ml.status IN ('member', 'unchecked', 'out_of_years')
+        """, (model.key,)).fetchall()
+        updates = []
+        for r in rows:
+            if not model.year_ok(r['year'] or title_year(r['title'])):
+                status = 'out_of_years'
+            elif r['status'] == 'out_of_years':
+                status = 'member' if r['source'] == 'feed' else 'unchecked'
+            else:
+                continue
+            if status != r['status']:
+                updates.append((status, model.key, r['listing_id']))
+        with self.conn:
+            self.conn.executemany("UPDATE model_listings SET status = ? WHERE model_key = ? AND listing_id = ?", updates)
+        return len(updates)
+
+    def model_scope(self, model: ModelDefinition, alias: str = 'a') -> Tuple[str, list]:
+        """a condition on auctions (as alias) for a model's auctions: what its feed listed or a checked title match
+        found, plus any auction whose page is tagged as the model, less the ones set aside for it (another
+        model's, or outside its years)"""
+        tags, tag_params = [], []
+        make_slug = slugify(model.make) if model.make else None
+        for slug in model.all_slugs():
+            if '/' in slug:
+                tags.append(f"{alias}.model_slug = ?")
+                tag_params.append(slug)
+            elif make_slug:
+                # a short slug is the tag's last part, and the tag's first part is the make's (see matches_tag)
+                tags.append(f"(substr({alias}.model_slug, -?) = ? AND (substr({alias}.model_slug, 1, ?) = ? "
+                            f"OR lower({alias}.make) = lower(?)))")
+                tag_params += [len(slug) + 1, '/' + slug, len(make_slug) + 1, make_slug + '/', model.make]
+            else:
+                tags.append(f"substr({alias}.model_slug, -?) = ?")
+                tag_params += [len(slug) + 1, '/' + slug]
+
+        years, year_params = [], []
+        if model.min_year:
+            years.append(f"({alias}.year IS NULL OR {alias}.year >= ?)")
+            year_params.append(model.min_year)
+        if model.max_year:
+            years.append(f"({alias}.year IS NULL OR {alias}.year <= ?)")
+            year_params.append(model.max_year)
+
+        tagged = ' OR '.join(tags) or '0'
+        condition = f"""({alias}.listing_id IN (SELECT listing_id FROM model_listings WHERE model_key = ? AND status = 'member')
+            OR (({tagged}) AND {alias}.listing_id NOT IN (
+                    SELECT listing_id FROM model_listings WHERE model_key = ? AND status IN ('other_model', 'out_of_years'))
+                {''.join(' AND ' + y for y in years)}))"""
+        return condition, [model.key] + tag_params + [model.key] + year_params
+
+    def model_listing_ids(self, model: ModelDefinition) -> List[int]:
+        """a model's auctions, and the title matches still to be checked: what a model run keeps fetched"""
+        condition, params = self.model_scope(model)
+        return [r[0] for r in self.conn.execute(f"""
+            SELECT a.listing_id FROM auctions a WHERE {condition}
+            UNION
+            SELECT listing_id FROM model_listings WHERE model_key = ? AND status = 'unchecked'
+        """, params + [model.key])]
+
     def get_meta(self, key: str) -> Optional[str]:
         row = self.conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
         return row['value'] if row else None
@@ -775,6 +1035,7 @@ class ActivityDB:
             self._rebuild_auctions()
         if version < 3:
             self.rebuild_participants()
+        # 4 and 5 only added tables, which TABLES creates
         if version < SCHEMA_VERSION:
             self.set_meta('schema_version', str(SCHEMA_VERSION))
 

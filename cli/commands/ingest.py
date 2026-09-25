@@ -82,7 +82,7 @@ def ingest_listing(conn, listing, make_id, model_id):
         variant_name = listing.get('variant', 'Standard')
         variant_id = get_or_create_variant(conn, model_id, variant_name)
         
-        sale_price_cents = listing.get('price') * 100 if 'price' in listing else None
+        sale_price_cents = listing['price'] * 100 if listing.get('price') is not None else None
         
         listing_details_json = None
         if 'listing_details' in listing and listing['listing_details']:

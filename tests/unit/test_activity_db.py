@@ -7,7 +7,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 
 from core.models.activity import AuctionSummary, AuctionDetail, Bid, Member, HistoryLink
-from storage.activity_db import ActivityDB
+from storage.activity_db import ActivityDB, SCHEMA_VERSION
 
 
 PV = 2
@@ -522,7 +522,7 @@ class TestMigration(unittest.TestCase):
 
             db = ActivityDB(path)
             self.assertFalse(db._url_is_unique())
-            self.assertEqual(db.get_meta('schema_version'), '3')
+            self.assertEqual(db.get_meta('schema_version'), str(SCHEMA_VERSION))
             self.assertEqual(db.query("SELECT COUNT(*) AS n FROM auctions")[0]['n'], 2)
             # the participants table is filled from the bids already there
             self.assertEqual([(r['slug'], r['n_bids']) for r in db.query("SELECT * FROM participants ORDER BY slug")],

@@ -83,7 +83,9 @@ extraction_rules:
   mileage:
     - type: listing_detail
       patterns:
-        - "([\\d,]+)\\s*(?:k\\s+)?miles"
+        # the "k" is captured so handle_k_miles can see it: "121k Miles" is 121,000, "1.5k Miles" 1,500;
+        # "67k Indicated Miles" and "89k Chassis Miles Shown" count too
+        - "(\\d[\\d,]*(?:\\.\\d+)?\\s*k?)\\s*(?:indicated\\s+|chassis\\s+)?miles"
       transform: handle_k_miles
     - type: title
       patterns:
@@ -124,6 +126,11 @@ activity:
   results_endpoint: /wp-json/bringatrailer/1.0/data/listings-filter
   results_per_page: 60
   results_sort: td
+  # results-feed categories (id: name) whose auctions fetch leaves till last, or skips with --skip-parts. discover
+  # and sync walk each one's feed (category[]=<id>) to know which auctions they are, at a request per 60
+  parts_categories:
+    379: Parts
+    380: Wheels
   http:
     # sent as the User-Agent, plainly: this crawler doesn't pass itself off as a browser
     user_agent: REVS-index-activity/0.2
