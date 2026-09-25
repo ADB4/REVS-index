@@ -8,10 +8,14 @@ from bs4 import BeautifulSoup
 
 from core.models.activity import AuctionSummary, AuctionDetail, Bid, Member, HistoryLink
 from extractors.field_extractors.vin_extractor import VINExtractor
+from sites.bringatrailer.listing_specs import ListingSpecs
 
 
 # bump when the parser starts capturing new fields, so `fetch --upgrade` knows what to re-fetch
-PARSER_VERSION = 3
+PARSER_VERSION = 4
+# fragments stored by an older parser leave out elements this one reads (4: the excerpt), so reparsing them can
+# only vouch for the version that stored them; raise this when a new field reads an element fragments didn't keep
+FRAGMENTS_COMPLETE_SINCE = 4
 
 # selectors parse_listing applies to the whole page; the rest are only read inside what these match
 PAGE_LEVEL_SELECTORS = (
@@ -156,11 +160,13 @@ def parse_results_page(data: dict) -> List[AuctionSummary]:
 
 class ActivityParser:
 
-    def __init__(self, selectors: dict):
+    def __init__(self, selectors: dict, specs: Optional[ListingSpecs] = None):
+        """specs reads engine, transmission, mileage, colors, listing details and excerpt; without it those stay empty"""
         missing = [key for key in REQUIRED_SELECTORS if not selectors.get(key)]
         if missing:
             raise ValueError(f"activity selectors missing from config: {', '.join(missing)}")
         self.selectors = selectors
+        self.specs = specs
 
     def parse_listing(self, html: str, url: str, now: Optional[float] = None) -> AuctionDetail:
         """everything a finished listing page says; raises NotFinal for a live page and LayoutError for one
@@ -174,9 +180,12 @@ class ActivityParser:
         return detail, self._fragments(soup, vms)
 
     def _fragments(self, soup: BeautifulSoup, vms: dict) -> str:
+        selectors = [self.selectors[key] for key in PAGE_LEVEL_SELECTORS]
+        if self.specs:
+            selectors += self.specs.page_selectors()
         wanted = set()
-        for key in PAGE_LEVEL_SELECTORS:
-            for css in outer_selectors(self.selectors[key]):
+        for selector in selectors:
+            for css in outer_selectors(selector):
                 wanted.update(id(elem) for elem in soup.select(css))
 
         # outermost matches only, in page order, so nothing is duplicated or reordered
@@ -210,6 +219,8 @@ class ActivityParser:
         self._apply_groups(soup, detail)
         self._apply_chassis(soup, detail)
         self._apply_history(soup, detail)
+        if self.specs:
+            self.specs.apply(soup, detail)
 
         # the listing's wordpress author is the consignor's account
         if detail.seller and str(vms.get('postAuthor', '')).isdigit():
@@ -331,8 +342,17 @@ class ActivityParser:
                 detail.era = value
             elif label == 'origin' and not detail.origin:
                 detail.origin = value
-            elif label == 'category' and not detail.category:
-                detail.category = value
+            elif label == 'category' and value:
+                detail.category = detail.category or value
+                if value not in detail.categories:
+                    detail.categories.append(value)
+                # a listing can carry several category tags; any convertible one counts, as it did in site.py
+                if 'convertible' in value.lower() or urlparse(link.get('href', '')).path.strip('/') == 'convertible':
+                    detail.convertible = True
+
+        # without category tags the page doesn't say, and a stored answer stands (save_detail keeps it)
+        if detail.categories and not detail.convertible:
+            detail.convertible = False
 
     def _apply_chassis(self, soup: BeautifulSoup, detail: AuctionDetail):
         for li in soup.select(self.selectors['listing_details']):

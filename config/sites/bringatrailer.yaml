@@ -83,7 +83,9 @@ extraction_rules:
   mileage:
     - type: listing_detail
       patterns:
-        - "([\\d,]+)\\s*(?:k\\s+)?miles"
+        # the "k" is captured so handle_k_miles can see it: "121k Miles" is 121,000, "1.5k Miles" 1,500;
+        # "67k Indicated Miles" and "89k Chassis Miles Shown" count too
+        - "(\\d[\\d,]*(?:\\.\\d+)?\\s*k?)\\s*(?:indicated\\s+|chassis\\s+)?miles"
       transform: handle_k_miles
     - type: title
       patterns:

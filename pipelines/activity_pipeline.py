@@ -7,7 +7,7 @@ from sites.bringatrailer.http_client import (
     BaTClient, HTTPStatusError, RateLimited, RobotsUnavailable, SiteUnavailable, challenge_marker
 )
 from sites.bringatrailer.activity_parser import (
-    ActivityParser, ListingParseError, NotFinal, PARSER_VERSION, parse_results_page
+    ActivityParser, FRAGMENTS_COMPLETE_SINCE, ListingParseError, NotFinal, PARSER_VERSION, parse_results_page
 )
 from storage.activity_db import ActivityDB
 from storage.raw_store import RawStore
@@ -42,6 +42,14 @@ def fmt_ts(ts: Optional[int]) -> str:
     if not ts:
         return '?'
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%Y-%m-%d')
+
+
+def reparsed_version(raw) -> int:
+    """the parser version a reparse of a stored page can vouch for: fragments an older parser kept may lack
+    elements the current one reads, so the listing stays due for `fetch --upgrade`"""
+    if raw.kind == 'fragments' and raw.parser_version < FRAGMENTS_COMPLETE_SINCE:
+        return raw.parser_version
+    return PARSER_VERSION
 
 
 class ActivityPipeline:
@@ -326,7 +334,7 @@ class ActivityPipeline:
                     detail = self.parser.parse_listing(raw.html, raw.url, now=raw.fetched_at)
                     if detail.listing_id != raw.listing_id:
                         raise ListingMismatch(f"stored page is listing {detail.listing_id}")
-                    self.db.save_detail(detail, raw.fetched_at, PARSER_VERSION)
+                    self.db.save_detail(detail, raw.fetched_at, reparsed_version(raw))
                     reparsed += 1
                 except Exception as e:
                     failed += 1

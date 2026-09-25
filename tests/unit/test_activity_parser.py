@@ -87,7 +87,7 @@ def comment(cid, kind, name, amount=0, ts=1000, author_id=None, url=None, conten
 
 def listing_html(result_text='Sold for <strong>USD $25,500</strong>', comments=None, post_author='137244',
                  chassis_li=VIN_LI, history=HISTORY, winner_slug=None, listing_id=555, ended=True,
-                 essentials=ESSENTIALS, groups=GROUPS, end_ts=1767210841, canonical=None):
+                 essentials=ESSENTIALS, groups=GROUPS, end_ts=1767210841, canonical=None, excerpt=''):
     """a synthetic finished listing page with the structure of a real one; ended=False gives a live auction"""
     if comments is None:
         # comment ids are site-wide, so each listing gets its own
@@ -121,6 +121,7 @@ def listing_html(result_text='Sold for <strong>USD $25,500</strong>', comments=N
     {essentials.format(chassis_li=chassis_li)}
     {history}
     {groups}
+    {excerpt}
     <script>
     var BAT_VMS = {json.dumps(vms)};
     </script>

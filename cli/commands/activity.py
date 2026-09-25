@@ -21,6 +21,7 @@ from sites.bringatrailer.http_client import (
     BaTClient, DEFAULT_USER_AGENT, ROBOTS_TOKEN, RateLimited, SiteUnavailable, listing_url
 )
 from sites.bringatrailer.activity_parser import ActivityParser, PARSER_VERSION
+from sites.bringatrailer.listing_specs import ListingSpecs
 from storage.activity_db import ActivityDB
 from storage.raw_store import RawStore, raw_db_path
 from pipelines.activity_pipeline import ActivityPipeline, CircuitOpen, fmt_ts
@@ -179,7 +180,7 @@ def build_pipeline(args, db: ActivityDB, config: dict, raw_store: RawStore) -> A
             long_pause_every=tuple(http['long_pause_every']) if http.get('long_pause_every') else None,
             long_pause_seconds=tuple(http['long_pause_seconds']) if http.get('long_pause_seconds') else None
         )
-    parser = ActivityParser(config['activity']['selectors'])
+    parser = ActivityParser(config['activity']['selectors'], ListingSpecs(config))
     return ActivityPipeline(client, parser, db, config['activity'], raw_store=raw_store)
 
 

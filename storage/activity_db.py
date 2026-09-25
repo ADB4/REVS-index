@@ -24,6 +24,11 @@ def vehicle_key(vin: Optional[str], chassis: Optional[str], make: Optional[str])
     return None
 
 
+def json_list(values: List[str]) -> Optional[str]:
+    """a list column's value; an empty list is None, so a page that yielded nothing keeps what an earlier fetch stored"""
+    return json.dumps(values, ensure_ascii=False) if values else None
+
+
 # the listing id is the key; a url can move between listings (renames, relists), so it isn't unique
 AUCTIONS_TABLE = """
 CREATE TABLE IF NOT EXISTS auctions (
@@ -37,6 +42,17 @@ CREATE TABLE IF NOT EXISTS auctions (
     era TEXT,
     origin TEXT,
     category TEXT,
+    -- every category tag, as a json list; category is the first
+    categories TEXT,
+    convertible INTEGER,
+    engine TEXT,
+    transmission TEXT,
+    mileage INTEGER,
+    exterior_color TEXT,
+    interior_color TEXT,
+    -- json lists of the listing details and the excerpt's paragraphs
+    listing_details TEXT,
+    excerpt TEXT,
     chassis TEXT,
     chassis_raw TEXT,
     vin TEXT,
@@ -124,6 +140,15 @@ ADDED_COLUMNS = [
     ('auctions', 'parser_version', 'INTEGER'),
     ('auctions', 'chassis_raw', 'TEXT'),
     ('auctions', 'refetch', 'INTEGER NOT NULL DEFAULT 0'),
+    ('auctions', 'categories', 'TEXT'),
+    ('auctions', 'convertible', 'INTEGER'),
+    ('auctions', 'engine', 'TEXT'),
+    ('auctions', 'transmission', 'TEXT'),
+    ('auctions', 'mileage', 'INTEGER'),
+    ('auctions', 'exterior_color', 'TEXT'),
+    ('auctions', 'interior_color', 'TEXT'),
+    ('auctions', 'listing_details', 'TEXT'),
+    ('auctions', 'excerpt', 'TEXT'),
 ]
 
 # 2: auctions.url no longer UNIQUE; 3: participants table
@@ -430,6 +455,10 @@ class ActivityDB:
                     title = COALESCE(?, title),
                     make = COALESCE(?, make), model = COALESCE(?, model), model_slug = COALESCE(?, model_slug),
                     era = COALESCE(?, era), origin = COALESCE(?, origin), category = COALESCE(?, category),
+                    categories = COALESCE(?, categories), convertible = COALESCE(?, convertible),
+                    engine = COALESCE(?, engine), transmission = COALESCE(?, transmission), mileage = COALESCE(?, mileage),
+                    exterior_color = COALESCE(?, exterior_color), interior_color = COALESCE(?, interior_color),
+                    listing_details = COALESCE(?, listing_details), excerpt = COALESCE(?, excerpt),
                     chassis = COALESCE(?, chassis), chassis_raw = COALESCE(?, chassis_raw), vin = COALESCE(?, vin),
                     country = COALESCE(?, country), location = COALESCE(?, location),
                     result = COALESCE(NULLIF(?, 'unknown'), result),
@@ -449,6 +478,10 @@ class ActivityDB:
             """, (
                 detail.title,
                 detail.make, detail.model, detail.model_slug, detail.era, detail.origin, detail.category,
+                json_list(detail.categories), None if detail.convertible is None else int(detail.convertible),
+                detail.engine, detail.transmission, detail.mileage,
+                detail.exterior_color, detail.interior_color,
+                json_list(detail.listing_details), json_list(detail.excerpt),
                 detail.chassis, detail.chassis_raw, detail.vin,
                 detail.country, detail.location,
                 detail.result,

@@ -60,7 +60,20 @@ class AuctionDetail:
     model_slug: Optional[str] = None
     era: Optional[str] = None
     origin: Optional[str] = None
+    # the first category tag; categories has every one
     category: Optional[str] = None
+    categories: List[str] = field(default_factory=list)
+    # None when the page has no category tags to tell, as most coupes and sedans don't
+    convertible: Optional[bool] = None
+
+    # read from the listing details the way the selenium scraper did
+    engine: Optional[str] = None
+    transmission: Optional[str] = None
+    mileage: Optional[int] = None
+    exterior_color: Optional[str] = None
+    interior_color: Optional[str] = None
+    listing_details: List[str] = field(default_factory=list)
+    excerpt: List[str] = field(default_factory=list)
 
     chassis: Optional[str] = None
     # the text after "Chassis:" as the page shows it
