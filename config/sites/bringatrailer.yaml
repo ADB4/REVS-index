@@ -124,6 +124,16 @@ activity:
   results_endpoint: /wp-json/bringatrailer/1.0/data/listings-filter
   results_per_page: 60
   results_sort: td
+  http:
+    # sent as the User-Agent, plainly: this crawler doesn't pass itself off as a browser
+    user_agent: REVS-index-activity/0.2
+    # a url or email where the site can reach you; when set it's added as "(+contact)"
+    contact: ""
+    # the name robots.txt groups are matched against; with no group of its own, the * group applies
+    robots_token: REVS-index-activity
+    # a longer break now and then: after a random 250-500 requests, 60-180 seconds
+    long_pause_every: [250, 500]
+    long_pause_seconds: [60, 180]
   selectors:
     comments_var: BAT_VMS
     listing_id: "[data-listing-currently]"
@@ -138,6 +148,9 @@ activity:
     listing_details: .essentials ul li
     history_item: .history .items a.item
     history_summary: .message em
+    # present on every finished listing; a live auction has neither
+    ended_marker: "#listing-bid.ended, #listing-bid-container.listing-closed"
+    canonical: link[rel=canonical]
 
 javascript:
   load_more_listings: |

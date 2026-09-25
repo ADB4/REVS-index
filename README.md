@@ -78,13 +78,13 @@ python3 cli/commands/ingest.py \
 
 `cli/commands/activity.py` tracks who sells, who bids and who wins across every completed bat auction. it doesn't use selenium: each listing page embeds its full comment thread as json (`var BAT_VMS`), so one GET per auction returns every bid with the bidder's id, amount and timestamp.
 
-two steps, both resumable (ctrl-c is safe):
+two steps:
 
 1. **discover**: pages through the site-wide results api (`/wp-json/bringatrailer/1.0/data/listings-filter`, 60 per page) and records each auction's id, url, result, price and end time
 2. **fetch**: downloads each discovered listing once and stores the seller, make/model, chassis/vin, every bid and the winner. it also follows the listing's "bat history" links, so earlier auctions of the same car are collected even when they fall outside the discovered window
 
 ```bash
-# daily incremental run: new results, then their bid histories
+# daily: new results, then the bid histories of what that run discovered
 python3 cli/commands/activity.py sync
 
 # backfill history, a chunk at a time (remembers where it stopped)
@@ -95,14 +95,98 @@ python3 cli/commands/activity.py fetch --limit 2000
 python3 cli/commands/activity.py sync --backfill --since 2025-01-01
 ```
 
+`sync` fetches only what its own discovery saw, plus already-fetched listings whose re-fetch is due (see "what gets saved"); `sync --all` works through the whole queue, like `fetch`. `--limit N` is a hard cap on listing pages, bat history links included: links left over from earlier runs go first, and new ones straight after the page that listed them. `--since` limits the queue to auctions ending on or after a date; bat history links found on those are still followed, whatever their date.
+
 after each fetch, auctions are grouped into vehicles (see below).
 
-requests are spaced `--delay` seconds apart (default 3s plus jitter, never below robots.txt's crawl-delay), 429/5xx responses back off, and robots-disallowed paths such as `/member/` are refused before any request is sent. at the default pace the full archive (~265k auctions) takes roughly 11–12 days, so run the backfill in chunks.
+### stopping and resuming
+
+ctrl-c is safe:
+
+- each listing is saved in one transaction, so a fetch stops between listings
+- `discover --backfill` keeps a cursor and resumes from it. `--start-page` never moves the cursor past pages it hasn't read, and `--reset-backfill-cursor` starts the backfill over
+- incremental discovery remembers the newest auction the last complete run saw (a watermark, seeded by the backfill). pages newer than that don't count toward the "nothing new" stop, so a run cut short by ctrl-c, a block or `--max-pages` leaves no hole: the next run walks through whatever the interrupted one missed
+
+one run per database: `discover`, `fetch`, `sync`, `link`, `reparse` and `reset-errors` take a lock on `<db>.lock` and exit at once if another run holds it. reports don't lock and are safe to run while a crawl writes.
+
+| exit status | meaning |
+| --- | --- |
+| 0 | done |
+| 1 | nothing was fetched and something failed |
+| 2 | stopped: the site pushed back, robots.txt ruled the crawl out, or too many failures in a row (the last lines say which) |
+| 75 | another run holds the database |
+| 130 | ctrl-c |
+
+### pacing and politeness
+
+before the backfill, read bat's terms of use and its live robots.txt, and consider asking bat.
+
+- requests are spaced `--delay` seconds apart (default 3s) plus up to 1.5s of jitter, never less than robots.txt's crawl-delay. every 250–500 requests the crawler takes a 1–3 minute break (`activity.http` in the yaml). that averages about 4.1s a request: the full archive (~265k auctions, ~270k requests) takes about 12–13 days non-stop
+- robots.txt is read from the site at the start of each run and every 24h, and applied per RFC 9309: the group for `robots_token` (or `*`), longest match wins, `*` and `$` patterns, percent-escapes normalized, and the url is checked as it will be sent, query string and params included. a missing robots.txt (4xx) means no rules; a 5xx, 429 or network error stops the run, and so does a file that rules out the results feed or listing pages. a disallowed url is refused without being requested. until the site's file has been read, the copy in the yaml applies, and differences between the two are printed
+- redirects are followed by hand, at most 3 hops on the same host and scheme, each one paced, counted and checked against robots.txt like the first url
+- 408, 429, 5xx and cdn 520–524 responses are retried after 15s, 30s, 60s and 120s. a `Retry-After` (in seconds or as a date) is a floor, and it holds every later request, not just the retry; a pause over 15 minutes stops the run with "resume after <utc time>"
+- a response body over 10 MB, or one still arriving 2 minutes after the request, is cut off
+- each run logs the first response's status and cdn/waf headers, which helps tell what a block looks like
+- the user agent is `activity.http.user_agent` in `config/sites/bringatrailer.yaml` (`REVS-index-activity/0.2`). set `contact` there to a url or email and it's sent as `REVS-index-activity/0.2 (+contact)`. the crawler doesn't pass itself off as a browser: no browser user agent, no browser headers, no tls imitation
+
+**stopping instead of hammering.** a site-level failure (401/403, retries used up, a challenge page, an unexpected status) isn't held against the listing, and 5 in a row stop the run. 20 failures of any kind in a row stop it too, e.g. after a markup change: layout errors don't use up a listing's attempts, errors that belong to the url (404, a redirect off the site) do. if auctions that discovery says have ended keep showing up without the page's "ended" marker, the run stops after 5 of them rather than skip every page.
+
+**daily budget and active hours.** off unless asked for, and remembered in the database once set:
+
+```bash
+# at most 10,000 requests per local day, only between 08:00 and 22:00 local time
+python3 cli/commands/activity.py fetch --daily-budget 10000 --active-hours 08:00-22:00
+
+# later runs keep those settings; to drop them
+python3 cli/commands/activity.py fetch --daily-budget off --active-hours off
+```
+
+outside the hours, or once the day's requests are used, the crawler pauses until it may go on. every run against the database shares the day's count. for the backfill this is the gentler way to go: at 10,000 requests a day, the archive takes about 27 days.
+
+### what gets saved, and when it's fetched again
+
+- only finished auctions: a page without bat's "ended" marker, or ending in the future (a live relist reached through bat history), isn't saved and isn't charged an attempt; it's fetched again on a later run
+- a finished page without a result, seller, make or category, or end time is a layout error: nothing is saved, the error is recorded, and no attempt is used
+- a queued url that serves a different listing is an error on that row, never a save under it
+- once fetched, a page's own title, result, price and end time win over later discovery; discovery still keeps the url and flags up to date
+- a fetched listing is fetched again when discovery reports it sold after the page said reserve not met, once 10 days after a reserve-not-met auction ended (post-auction deals), and when the page was saved before, or within 10 minutes of, the auction's end
+- a bid count that disagrees with the page's own counter is saved and noted in `fetch_error`; `fetch --recheck-mismatches` fetches those listings again
+
+### recovering from failures
+
+a listing that fails 3 times (`--max-attempts`) drops out of the queue. after a block, an outage or a bug fix:
+
+```bash
+# listings and bat history links that ran out of attempts become eligible again
+python3 cli/commands/activity.py reset-errors
+
+# or allow more attempts for one run
+python3 cli/commands/activity.py fetch --max-attempts 6
+```
+
+### stored pages and reparse
+
+every fetched listing keeps what the parser read in `<db>_raw.db`, next to the database (`--raw-db` puts it elsewhere): the embedded comment data plus the page elements the parser uses, gzipped, about 18 KB a listing (roughly 5 GB for the archive). if re-parsing those fragments wouldn't give exactly the result the whole page gave, the whole page is kept instead. a parser fix can then be applied without downloading anything:
+
+```bash
+python3 cli/commands/activity.py reparse                                   # every stored page
+python3 cli/commands/activity.py reparse --where "make = 'Porsche'"         # a sql condition on auctions
+python3 cli/commands/activity.py reparse --ids-from listing_ids.txt         # one listing id per line
+```
+
+reparse keeps each listing's original fetch time. a fix that needs parts of the page the fragments don't hold needs a real re-fetch; scope it instead of re-fetching everything:
+
+```bash
+python3 cli/commands/activity.py fetch --where "seller_type IS NULL AND end_ts < 1600000000"
+python3 cli/commands/activity.py fetch --ids-from listing_ids.txt
+```
+
+those listings are marked stale (`parser_version` goes to 0 while their data stays in the reports) and fetched again; rerunning the same command after an interruption picks up where it stopped. `fetch --upgrade` re-fetches everything saved by an older parser version.
 
 ### reports
 
 ```bash
-python3 cli/commands/activity.py report                       # top sellers, bidders, buyers
+python3 cli/commands/activity.py report                       # overview, top sellers, bidders, buyers
 python3 cli/commands/activity.py report --model bmw/e46-m3    # scoped to a model (or a make: --model bmw)
 python3 cli/commands/activity.py report --member lummy1088    # one member: sold, bid on, won, counterparties
 python3 cli/commands/activity.py report --pairs               # sellers whose auctions the same bidders keep showing up on
@@ -110,21 +194,30 @@ python3 cli/commands/activity.py report --vehicle WBSBR934X2EX23144   # every ba
 python3 cli/commands/activity.py report --resales             # members who resell cars they won: hold time, price change
 ```
 
+`--model` and `--since` apply to the leaderboards, `--pairs` and `--resales`; `--member`, `--vehicle`, `--pairs` and `--resales` are one at a time. a scoped report leaves out the whole-database overview.
+
+`report --member` puts together a profile of one person from data that is public but scattered: every bid and its time, what they won and spent, what they resold and for how much, and a seller's location. keep the database private, and don't publish per-member reports.
+
 ### vehicle tracking
 
 each auction gets a `vehicle_id` (the lowest listing id of that car). two auctions are the same car when either:
 
-- they share a 17-character vin, or the same chassis number within the same make (pre-1981 chassis numbers are short and repeat across makes)
+- they share a 17-character vin, or the same chassis number within the same make (pre-1981 chassis numbers are short and repeat across makes). parts and automobilia listings are never grouped by vin, since they can quote a donor car's
 - one lists the other under "bat history", which also catches vins typed differently between listings
 
 `vehicle_timeline` labels each auction by what changed since the car's previous one:
 
 | transition | meaning |
 | --- | --- |
+| `first_seen` | the car's first auction here |
 | `resold_by_buyer` | the previous buyer is now the seller |
 | `relisted_after_sale` | the same seller again after a "sold" result, usually a sale that fell through |
-| `relisted_unsold` | the same seller again after reserve not met |
+| `relisted_unsold` | the same seller again after reserve not met, or after a withdrawn listing |
 | `new_seller` | someone else is selling: the car changed hands off bat, or went through a dealer |
+| `unknown_seller` | this auction's seller couldn't be read |
+| `unknown_prev` | the previous auction's result or seller is unknown, so there's nothing to compare with |
+
+an auction without an end time takes one from another listing's bat history, or sorts last.
 
 one real car, from `report --vehicle WBSBR934X2EX23144`:
 
@@ -139,39 +232,42 @@ ended       result  price    seller    buyer        what happened        days si
 
 prices are hammer prices: buyer's fees, shipping and any work done while the car was held are not included.
 
+the header says how many of the car's known auctions are fetched. auctions bat history mentions that aren't fetched yet (discovered or not) are listed under the history, and a label is marked "(provisional)" when one of them ended just before it: it may change once that auction is fetched. a chassis number shared by several cars lists them; pick one by listing url or id.
+
 ```bash
-# fetch one car and its whole bat history
+# fetch one car and its whole bat history (a full url, one without https://, or just the slug)
 python3 cli/commands/activity.py fetch --url https://bringatrailer.com/listing/2002-bmw-m3-convertible-106/
 
-# regroup vehicles without fetching anything
+# rebuild the participants table and regroup vehicles, without fetching anything
 python3 cli/commands/activity.py link
-
-# re-fetch listings saved by an older version of the parser (e.g. before vins were captured)
-python3 cli/commands/activity.py fetch --upgrade
 ```
 
 ### schema
 
-data lives in `data/db/bat_activity.db` (sqlite). members are keyed by their `/member/<slug>/` slug, which is the same whether they appear as a seller, bidder or buyer.
+data lives in `data/db/bat_activity.db` (sqlite), stored pages in `data/db/bat_activity_raw.db`. members are keyed by their `/member/<slug>/` slug, which is the same whether they appear as a seller, bidder or buyer.
 
 | table / view | contents |
 | --- | --- |
-| `auctions` | one row per listing: result, price, end time, make/model, seller, high bidder, winner, bid counts |
+| `auctions` | one row per listing: result, price, end time, make/model, chassis (as parsed and as written), seller, high bidder, winner, bid counts, fetch state |
 | `bids` | one row per bid: listing, bidder, amount, timestamp |
 | `members` | slug, display name, numeric user id |
-| `auction_participants` | one row per member per auction bid on: bid count, max bid, won |
-| `member_activity` | per-member totals for selling, bidding and winning (money columns are USD only) |
+| `participants` | one row per member per auction bid on: bid count, max bid, won. kept in step with `bids`; `link` rebuilds it |
+| `auction_participants` | `participants` with each auction's seller, model, result and price |
+| `member_activity` | per-member totals for selling, bidding and winning (money columns are USD only); `win_rate` is wins among the auctions bid on, and `won_without_bid` counts wins with no parsed bid from the winner |
 | `seller_bidder_pairs` | how often each bidder bids on / wins each seller's auctions |
 | `listing_links` | "bat history" links from a listing to other auctions of the same car, with bat's "sold by x to y" summary |
 | `vehicle_timeline` | every auction of every tracked car in order, with transition, days since previous and price change |
 | `member_resales` | cars a member won and later sold again on bat: price paid, resale price, days held |
+| `meta` | the backfill cursor, discovery watermark, budget settings and counts, schema version |
 
-two consistency checks show up in `report`:
+`report` checks the data as well:
 
-- `auctions.bids_reported` is the page's own bid counter. `report` flags listings where it disagrees with the bids parsed from the page
+- `auctions.bids_reported` is the page's own bid counter; listings where it disagrees with the bids parsed from the page are flagged
+- stored bid rows against each listing's `n_bids`, prices above the top bid (post-auction deals, or a parse problem), and fetched rows missing a seller, make or result
 - bat history's "sold by x to y" text is compared with the stored seller and buyer of each linked sale
+- the results feed's total against the auctions stored from it
 
-older databases are upgraded in place when opened. listings saved before vin capture need `fetch --upgrade` to pick up chassis numbers and history links.
+older databases are upgraded in place when opened; the first open after this change rebuilds the `auctions` table (the url is no longer unique) and fills `participants` from the bids, about 15s at the full archive's size. listings saved by an older parser version are re-fetched by `fetch --upgrade`; `reparse` only covers listings fetched with the raw store.
 
 ## adding a new site
 
@@ -354,12 +450,16 @@ time.sleep(delay.get_delay())
 
 ### user agents
 
+the selenium scraper can pick a browser user agent at random:
+
 ```python
 from strategies.anti_detection.user_agent import UserAgentStrategy
 
 ua = UserAgentStrategy()
 user_agent = ua.get_random_user_agent()
 ```
+
+the activity crawler (`cli/commands/activity.py`) never does this: it sends one honest user agent of its own, set in the yaml, and none of the strategies in this section apply to it.
 
 ### scrolling
 
@@ -521,10 +621,14 @@ extraction_rules:
 
 ### browser detection
 
+for the selenium scraper:
+
 1. verify anti-detection strategies are applied
 2. check user agent rotation
 3. verify delays are respected
 4. consider adding more human-like behaviors
+
+the activity crawler doesn't disguise itself. if it's blocked, it stops (exit status 2); slow down, set a daily budget, or ask the site, rather than make it look like a browser.
 
 ### tests failing
 
