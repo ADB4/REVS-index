@@ -32,12 +32,15 @@ from pipelines.model_prices import (
     mileage_band, mileage_band_order, monthly, price_groups, sale_period, split_rows, summarize, is_usd_sale
 )
 from extractors.variant import extract_variant
+from pipelines.model_export import OLD_FILTERS, export_rows, write_csv, write_json
 from pipelines.crawl_budget import CrawlBudget, parse_active_hours
 
 
 ROOT = os.path.join(os.path.dirname(__file__), '../..')
 CONFIG_PATH = os.path.join(ROOT, 'config/sites/bringatrailer.yaml')
 DEFAULT_DB = os.path.join(ROOT, 'data/db/bat_activity.db')
+# where the selenium scraper wrote <slug>_data.json, which normalize, ingest and the llm step read
+EXPORT_DIR = os.path.join(ROOT, 'data/json/output/raw')
 
 
 STOP_HINTS = {
@@ -475,6 +478,77 @@ def report_prices(db: ActivityDB, args):
         ('buyer', 'buyer', text), ('url', 'url', text)
     ])
     print()
+
+
+def resolve_model(db: ActivityDB, ref: str):
+    """the followed model a --model names, None for a slug that isn't followed; ValueError if it names several"""
+    matches = db.find_models(ref)
+    if len(matches) > 1:
+        raise ValueError(f"--model {ref} names {len(matches)} followed models: {', '.join(m.key for m in matches)}; "
+                         "give one of those keys")
+    return matches[0] if matches else None
+
+
+EXPORT_SKIPS = {
+    'non_usa': 'outside the USA', 'modified': "with 'modified' in the title", 'no_vin': 'without a 17-character vin', 'parts': 'parts listings', 'withdrawn': 'withdrawn',
+}
+
+
+def run_export(db: ActivityDB, args, config: dict) -> int:
+    """a model's fetched auctions as the selenium scraper's <slug>_data.json, which normalize, ingest and the llm
+    step read. by default it leaves out what that scraper left out; --all and the --include-* flags keep them"""
+    try:
+        model_def = resolve_model(db, args.model)
+    except ValueError as e:
+        print(e)
+        return 1
+    if not model_def:
+        print(f"{args.model} isn't a followed model, so its auctions are picked by their model tags, and make and "
+              f"model come from the listing pages")
+    where, params = auction_filters(db, argparse.Namespace(model=args.model, model_def=model_def, since=args.since), 'a')
+    keep = set(OLD_FILTERS) if args.all else {name for name in OLD_FILTERS if getattr(args, f"include_{name}")}
+    result = export_rows(db, where, params, model_def, config['site']['source_name'], keep, withdrawn=args.all)
+    rows = result['rows']
+
+    waiting = db.query(f"SELECT COUNT(*) AS n FROM auctions a WHERE a.fetched_at IS NULL{where}", params)[0]['n']
+    skipped = [f"{n:,} {EXPORT_SKIPS.get(reason, reason)}" for reason, n in sorted(result['skipped'].items())]
+    if skipped:
+        print(f"left out: {', '.join(skipped)}")
+    if waiting:
+        print(f"{waiting:,} of the model's auctions aren't fetched yet; `model {args.model}` fetches them")
+    foreign = sum(1 for r in rows if r.row['result'] == 'sold' and r.row['currency'] != 'USD')
+    if foreign:
+        print(f"{foreign:,} sale(s) in other currencies are written without a price (the csv has the amount)")
+    if not rows:
+        print("nothing to export")
+        return 1
+    # ingest files a whole file under its first record's make and model
+    tags = sorted({r.row['model_slug'] or '?' for r in rows})
+    if not model_def and len(tags) > 1:
+        print(f"{args.model} covers {len(tags)} models ({', '.join(tags[:6])}{', ...' if len(tags) > 6 else ''}); "
+              f"export one of them, or follow the model with `model` first")
+        return 1
+
+    older = sum(1 for r in rows if (r.row['parser_version'] or 0) < PARSER_VERSION)
+    if older:
+        print(f"{older:,} of these were saved by an older parser, so their engine, mileage, colors and the like are "
+              f"missing; `model {args.model} --upgrade` fetches them again")
+    if model_def:
+        missing = [flag for flag, value in (('--make', model_def.make), ('--model-full', model_def.model_full),
+                                            ('--model-short', model_def.model_short)) if not value]
+        if missing:
+            print(f"{model_def.key} has no {', '.join(missing)}, so "
+                  f"{'every variant is Standard and ' if '--model-short' in missing or '--make' in missing else ''}"
+                  f"make and model come from the listing pages; `model {model_def.key} {' '.join(m + ' ...' for m in missing)}` "
+                  f"sets them")
+
+    name = model_def.output_name() if model_def else normalize_slug(args.model).replace('/', '-')
+    path = args.output or os.path.join(EXPORT_DIR, f"{name}_data.{args.format}")
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    (write_csv if args.format == 'csv' else write_json)(rows, path)
+    sold = sum(1 for r in rows if r.listing.result == 'Sold')
+    print(f"{len(rows):,} auction(s) ({sold:,} sold) written to {path}")
+    return 0
 
 
 def reset_errors(db: ActivityDB):
@@ -1034,6 +1108,21 @@ def main(argv=None):
                        help='only send requests in this local window, e.g. 08:00-22:00, remembered for later runs; '
                             'off to remove')
 
+    export = sub.add_parser('export', help="write a model's auctions as the selenium scraper's json, for normalize, "
+                                           "ingest and the llm step (no network)")
+    export.add_argument('--model', required=True, help="a followed model's key or slug, in either spelling")
+    export.add_argument('--output', metavar='FILE',
+                        help='where to write (default: data/json/output/raw/<slug>_data.json, or .csv)')
+    export.add_argument('--format', choices=('json', 'csv'), default='json',
+                        help="json: the old files' shape exactly; csv: the same fields plus the crawler's ids and counts")
+    export.add_argument('--since', type=date_arg, help='only auctions ending on or after YYYY-MM-DD')
+    export.add_argument('--all', action='store_true',
+                        help="keep everything the old scraper left out: the filters below, and withdrawn auctions. the "
+                             "model's year range always applies (change it with `model --min-year/--max-year`)")
+    export.add_argument('--include-non-usa', action='store_true', help='keep listings outside the USA')
+    export.add_argument('--include-modified', action='store_true', help="keep titles that say 'modified'")
+    export.add_argument('--include-no-vin', action='store_true', help='keep listings without a 17-character vin')
+
     sub.add_parser('link', help='rebuild the participants table and regroup auctions into vehicles (no network)')
     reparse = sub.add_parser('reparse', help='run the current parser over stored pages again (no network)')
     add_scope_args(reparse, 'reparse')
@@ -1096,15 +1185,15 @@ def run_command(args, parser: argparse.ArgumentParser, config: dict, urls) -> in
             reset_errors(db)
             return 0
 
+        if args.command == 'export':
+            return run_export(db, args, config)
+
         if args.command == 'report':
-            args.model_def = None
-            if args.model:
-                matches = db.find_models(args.model)
-                if len(matches) > 1:
-                    print(f"--model {args.model} names {len(matches)} followed models: "
-                          f"{', '.join(m.key for m in matches)}; give one of those keys")
-                    return 1
-                args.model_def = matches[0] if matches else None
+            try:
+                args.model_def = resolve_model(db, args.model) if args.model else None
+            except ValueError as e:
+                print(e)
+                return 1
             if args.vehicle:
                 report_vehicle(db, args)
             elif args.member:
