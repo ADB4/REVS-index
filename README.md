@@ -2,8 +2,8 @@
 
 bring a trailer data, collected two ways:
 
-- **listing scraper** (selenium): one model's listings in detail (vin, mileage, engine, colors, price) → json → normalized json → postgres
-- **activity crawler** (plain http, no browser): who sold, bid on and won every completed auction → sqlite, with reports on members and individual cars
+- **activity crawler** (plain http, no browser): a model's auctions (price, specs, and who sold, bid on and bought each car), or every completed auction → sqlite, with reports on prices, members and individual cars, and an export in the scraper's json shape
+- **listing scraper** (selenium, the original): one model's listings in detail → json. `activity.py model … && activity.py export …` now does its job; it stays in the repo, as do the tools after it: json → normalized json → postgres
 
 ## setup
 
@@ -18,6 +18,8 @@ run everything from the repo root: the scraper writes to relative paths. the scr
 ## usage
 
 ### listing scraper
+
+the activity crawler's `model` and `export` replace this (see below); normalize, ingest and the llm step read either's json.
 
 ```bash
 # one model → data/json/output/raw/e46-m3_data.json
@@ -60,7 +62,30 @@ python3 llm/json_processor.py data/json/output/raw/e46-m3_data.json -o data/json
 
 ### activity crawler
 
-each listing page embeds its whole comment thread as json (`var BAT_VMS`), so one GET per auction returns every bid with bidder, amount and time. `discover` pages through the site-wide results api and queues finished auctions; `fetch` downloads the queue and follows each listing's "bat history" links to earlier auctions of the same car. before a backfill, read bat's terms of use and live robots.txt, and consider asking bat.
+each listing page embeds its whole comment thread as json (`var BAT_VMS`), so one GET per auction returns every bid with bidder, amount and time, alongside the listing details the scraper read (engine, transmission, mileage, colors, excerpt). before a big crawl, read bat's terms of use and live robots.txt, and consider asking bat.
+
+#### one model
+
+```bash
+# its auctions, their bid histories, then prices and people; rerun it to pick up new sales
+python3 cli/commands/activity.py model chevrolet/c8 --make Chevrolet --model-full "C8 Corvette" --model-short "Corvette " --since 2026-03-24
+python3 cli/commands/activity.py model --json cli/input/cars_testCorvetteC6.json     # the scraper's model lists work too
+
+python3 cli/commands/activity.py report --model chevrolet/c8     # or its short spelling, c8; --since YYYY-MM-DD scopes
+python3 cli/commands/activity.py export --model chevrolet/c8     # → data/json/output/raw/chevrolet-c8_data.json
+```
+
+the slug is the model page's address: `chevrolet/c8` for bringatrailer.com/chevrolet/c8/, or the scraper's short form (`e46-m3` for /e46-m3/); either spelling names the same model afterwards. a model page's "show more" pages the results api with a filter the page embeds (its sub-models' keyword pages), so `model` reads the page, keeps the filter and the sub-models' tag spellings in the database, and pages through that model's feed back to `--since` or the first auction. it fetches what's new, plus each car's bat history links (the same car's other auctions), and ends with the report. a rerun only asks for what's new, `--max-pages` spreads a long first walk over several runs, and ctrl-c resumes where it stopped. a feed that lists far more auctions than its page said isn't being narrowed by the filter, and the run refuses it rather than record the whole site as the model.
+
+the definition (`--make`, `--model-full`, `--model-short`, `--min-year`/`--max-year`) is kept too, so later runs, reports and exports need only the slug; without the names, variants come out "Standard" and make and model are the listing pages' own (both commands say so); changing the years re-sorts what was already found. the page is read again once a week, or with `--refresh-filter`; `--filter-url` takes the listings-filter request from the browser's network tab instead, and stands until `--refresh-filter`. with no readable model page, `model` falls back to the site-wide feed back to `--since` (required then), matches titles on make and `--model-short` (a trailing space means a whole word, as in the scraper's lists), and keeps the ones whose pages are tagged as the model; it lists the tags it ruled out. a challenge page instead of the model page stops the run, like any block. `--limit`, `--no-follow-history`, `--no-report`, `--delay`, `--daily-budget` and `--active-hours` work as for `fetch`.
+
+`report --model` leads with prices: auctions by result, sell-through, and median, low and high usd sale price by quarter (month under a year), model year, transmission and mileage, then the latest sales with specs, seller and buyer. then the people: top sellers, bidders and buyers.
+
+`export` writes the scraper's json shape (`Listing.to_dict`) for normalize, ingest and the llm step: make and model from the definition, variant from the title, price and buyer only for sales. like the scraper it skips listings outside the usa, titled "modified" or without a vin; `--all` keeps them and withdrawn auctions (or one at a time: `--include-non-usa`, `--include-modified`, `--include-no-vin`). the model's year range always applies, and parts listings are never exported. `--format csv` adds the crawler's ids and counts; `--since` and `--output` as usual. an unfollowed slug covering several models (a make, say) is refused: ingest files a whole file under one model.
+
+#### the whole site (optional)
+
+`discover` pages through the site-wide results api and queues finished auctions; `fetch` downloads the queue and follows each listing's bat history links. models followed with `model` report whatever is fetched this way too.
 
 ```bash
 # daily: new results, then what that run discovered (plus re-fetches that are due)
@@ -80,7 +105,7 @@ python3 cli/commands/activity.py fetch --daily-budget 10000 --active-hours 08:00
 ```bash
 # reports: read-only, safe while a crawl runs
 python3 cli/commands/activity.py report                         # overview, top sellers, bidders, buyers
-python3 cli/commands/activity.py report --model bmw/e46-m3      # or a make (--model bmw); --since YYYY-MM-DD also scopes
+python3 cli/commands/activity.py report --model bmw/e46-m3      # a model's prices and people; a make (--model bmw) works too
 python3 cli/commands/activity.py report --member <slug>         # one member: sold, bid on, won, counterparties
 python3 cli/commands/activity.py report --vehicle <vin>         # every auction of one car (vin, chassis, url or listing id)
 python3 cli/commands/activity.py report --pairs                 # sellers whose auctions the same bidders keep showing up on
@@ -104,12 +129,12 @@ python3 cli/commands/activity.py fetch --recheck-mismatches                # bid
 
 `fetch --where`/`--ids-from` mark the matches stale (their data stays in reports) and re-fetch them; rerun the same command to resume.
 
-**stopping and resuming.** ctrl-c is safe: each listing is saved in one transaction, `discover --backfill` resumes from a cursor (`--reset-backfill-cursor` starts over), and incremental discovery keeps a watermark, so an interrupted run leaves no gap. commands that write take `<db>.lock`: one run per database.
+**stopping and resuming.** ctrl-c is safe: each listing is saved in one transaction, `discover --backfill` resumes from a cursor (`--reset-backfill-cursor` starts over), and incremental discovery keeps a watermark, so an interrupted run leaves no gap; `model` keeps a cursor and watermark per model page feed. commands that write take `<db>.lock`: one run per database.
 
 | exit | meaning |
 | --- | --- |
 | 0 | done |
-| 1 | nothing was fetched and something failed |
+| 1 | nothing was fetched and something failed, or `model` couldn't find a model's auctions as asked |
 | 2 | stopped: the site pushed back, robots.txt ruled the crawl out, or too many failures in a row (the last lines say which) |
 | 75 | another run holds the database |
 | 130 | ctrl-c |
@@ -125,16 +150,21 @@ python3 -m unittest discover -s tests/integration   # the scraper's page parsing
 
 ```
 cli/commands/     entry points: scrape, normalize, ingest (scraper); activity (crawler)
-cli/input/        model lists for scrape --json
-config/sites/     bringatrailer.yaml: selectors, extraction_rules, javascript (scraper);
-                  activity, robots_txt fallback (crawler)
+cli/input/        model lists for scrape --json and activity model --json
+config/sites/     bringatrailer.yaml: selectors, extraction_rules, javascript (scraper; the crawler reads the
+                  detail_page selectors and extraction_rules too); activity, robots_txt fallback (crawler)
 core/browser/     selenium wrapper
-core/models/      dataclasses: Listing, ScrapeConfig (scraper); Member, AuctionSummary, AuctionDetail, Bid (crawler)
+core/models/      dataclasses: Listing, ScrapeConfig (scraper); Member, AuctionSummary, AuctionDetail, Bid,
+                  ModelDefinition (crawler)
 sites/            SiteFactory, BaseSite
-  bringatrailer/  site.py (scraper); http_client.py, robots.py, activity_parser.py (crawler)
-extractors/       field extractors: vin, engine, transmission, mileage, color, price (the crawler reuses vin)
+  bringatrailer/  site.py (scraper); http_client.py, robots.py, activity_parser.py, listing_specs.py,
+                  model_page.py (crawler)
+extractors/       field extractors: vin, engine, transmission, mileage, color, price, and variant.py (the crawler
+                  runs engine, transmission, mileage and color without a browser and reuses vin's pattern; export
+                  runs variant)
 strategies/       the scraper's anti-detection: delays, scrolling, clicks, random browser user agents
-pipelines/        scraping_pipeline.py (scraper); activity_pipeline.py, crawl_budget.py (crawler)
+pipelines/        scraping_pipeline.py (scraper); activity_pipeline.py, crawl_budget.py, model_pipeline.py,
+                  model_prices.py, model_export.py (crawler)
 storage/          json_storage.py (scraper); activity_db.py, raw_store.py (crawler)
 llm/, utils/      json post-processing
 tests/            unit/ (offline), integration/ (mock html)
@@ -149,11 +179,17 @@ data/db/          crawler databases (gitignored)
 ### activity crawler
 
 ```
+model      model page → its feed filter (auctionsCompletedInitialData.base_filter) → models
+           results api with that filter → auctions, model_listings; then fetch those, and report
 discover   results api (/wp-json/bringatrailer/1.0/data/listings-filter, 60 a page) → auctions (the queue)
-fetch      listing page → ActivityParser (BAT_VMS json + page elements) → auctions, bids, members, listing_links
+fetch      listing page → ActivityParser (BAT_VMS json + page elements; ListingSpecs runs the scraper's
+           extractors on the listing details) → auctions, bids, members, listing_links
            parsed fragments → <db>_raw.db, for reparse (~18 KB a listing, ~5 GB for the archive)
            then auctions are regrouped into vehicles
+export     a model's auctions → Listing.to_dict json, the scraper's shape
 ```
+
+`discover_feed` runs `discover` twice for one feed: the backfill from a page before its cursor down to `--since` or the end, then what ended after the watermark a completed run left, stopping at the watermark. the site-wide feed keeps its cursor and watermark under plain meta keys, each model page's feed under its own `model:<key>:<slug>:<filter hash>:` prefix, so a changed filter starts afresh. a model's auctions are what its feed listed (`model_listings`), plus fetched auctions tagged as it, less the ones set aside: outside its years, or title matches tagged as another model.
 
 every request goes through `BaTClient`:
 
@@ -175,7 +211,7 @@ auctions sharing a 17-character vin, a chassis number within one make, or a bat 
 
 | table / view | contents |
 | --- | --- |
-| `auctions` | one row per listing: result, price, end time, make/model, vin/chassis, seller, winner, bid counts, fetch state |
+| `auctions` | one row per listing: result, price, end time, make/model, vin/chassis, seller, winner, bid counts, specs (engine, transmission, mileage, colors, categories, convertible, listing details, excerpt), fetch state |
 | `bids` | listing, bidder, amount, time |
 | `members` | slug, display name, numeric user id |
 | `participants` | one row per member per auction bid on: bid count, max bid, won |
@@ -185,6 +221,8 @@ auctions sharing a 17-character vin, a chassis number within one make, or a bat 
 | `listing_links` | bat history links between auctions of the same car, with bat's "sold by x to y" |
 | `vehicle_timeline` | every auction of every car in order: transition, days since previous, price change |
 | `member_resales` | cars a member won and later resold: paid, resold for, days held |
-| `meta` | backfill cursor, discovery watermark, budget settings and counts, schema version |
+| `models` | models followed with `model`: slugs, make and names, year range, each model page's feed filter |
+| `model_listings` | the auctions each model's discovery turned up: `member`, `unchecked` (a title match to fetch), `other_model` or `out_of_years` |
+| `meta` | backfill cursors, discovery watermarks (site-wide and per model feed), budget settings and counts, schema version |
 
-`report` also checks the data: bid counts against each page's counter, prices above the top bid, missing fields, bat history's "sold by x to y" against stored sellers and buyers, and the feed's total against stored auctions. older databases migrate in place when opened.
+`report` also checks the data: bid counts against each page's counter, prices above the top bid, missing fields, bat history's "sold by x to y" against stored sellers and buyers, and the feed's total against stored auctions. older databases migrate in place when opened; listings saved before parser 4 get their specs from `fetch --upgrade` (or `reparse`, for pages stored whole).
